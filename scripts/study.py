@@ -340,7 +340,7 @@ def deadline_label(due, now):
 
 
 def status_lines(result, now, closed=False):
-    lines = [f"{'✅' if item['submitted'] else '⏳'} {item['name']} · "
+    lines = [f"{'✓' if item['submitted'] else '✕'} **{item['name']}** · "
              f"{'제출 완료' if item['submitted'] else '미제출'}" for item in result]
     count = sum(item["submitted"] for item in result)
     total = len(result)
