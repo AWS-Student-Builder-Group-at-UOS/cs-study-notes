@@ -14,7 +14,6 @@ import re
 import subprocess
 import sys
 import unicodedata
-from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -82,12 +81,12 @@ def calendar_events():
     for index, due in enumerate(deadlines, 1):
         for days in config.REMINDER_DAYS:
             scheduled = datetime.combine(due - timedelta(days=days), time(), KST)
-            events.append({"id": f"{due}:d-{days}", "round": index,
-                           "deadline": due.isoformat(), "kind": "reminder", "days_left": days,
+            events.append({"round": index,
+                           "deadline": due.isoformat(), "kind": "reminder",
                            "scheduled_at": scheduled.isoformat()})
         if config.SEND_FINAL_RESULTS:
             scheduled = datetime.combine(due + timedelta(days=1), time(), KST)
-            events.append({"id": f"{due}:final", "round": index,
+            events.append({"round": index,
                            "deadline": due.isoformat(), "kind": "final",
                            "scheduled_at": scheduled.isoformat()})
     return events
@@ -125,7 +124,7 @@ def validate_state(state):
     try:
         if (not isinstance(state, dict) or type(state["version"]) is not int
                 or state["version"] != 2 or not isinstance(state["members"], dict)
-                or not isinstance(state["events"], dict) or not isinstance(state["rounds"], dict)):
+                or not isinstance(state["rounds"], dict)):
             raise ValueError
         folders = set()
         names = set()
@@ -138,19 +137,6 @@ def validate_state(state):
             if folder != name and not re.fullmatch(re.escape(f"[종료] {name}") + r"(?: \([2-9][0-9]*\)| \(1[0-9]+\))?", folder):
                 raise ValueError
             folders.add(folder.casefold())
-        for event_id, event in state["events"].items():
-            if (not isinstance(event_id, str)
-                    or not re.fullmatch(r"\d{4}-\d{2}-\d{2}:(?:d-[0-3]|final)", event_id)
-                    or event not in ("pending", "sent")):
-                raise ValueError
-            date.fromisoformat(event_id.split(":", 1)[0])
-        manual = state.get("manual", {})
-        if not isinstance(manual, dict):
-            raise ValueError
-        if manual and (not isinstance(manual.get("id"), str)
-                       or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", manual["id"])
-                       or manual.get("status") not in ("pending", "sent")):
-            raise ValueError
         for deadline, record in state["rounds"].items():
             date.fromisoformat(deadline)
             if (not isinstance(record, dict) or type(record["fine"]) is not int or record["fine"] <= 0
@@ -167,13 +153,14 @@ def load_state(root):
     if (root / ".study").is_symlink() or path.is_symlink():
         raise StudyError(".study는 실제 폴더와 파일이어야 합니다.")
     if not path.exists():
-        return {"version": 2, "members": {}, "rounds": {}, "events": {}}
+        return {"version": 2, "members": {}, "rounds": {}}
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(state, dict) and state.get("version") == 1:
             state = {"version": 2,
                      "members": {name: entry["folder"] for name, entry in state["members"].items()},
-                     "rounds": {}, "events": {key: entry["status"] for key, entry in state["events"].items()}}
+                     "rounds": {}}
+        state = {key: state[key] for key in ("version", "members", "rounds")}
     except (ValueError, UnicodeError, KeyError, TypeError, AttributeError):
         raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
     validate_state(state)
@@ -422,8 +409,6 @@ def next_round_lines(due, now):
         return ["이번이 마지막 회차였어요. 끝까지 함께해 주셔서 고마워요! 🐾"]
     number = deadlines.index(next_due) + 1
     label = deadline_label(next_due, now)
-    if next_due < now.astimezone(KST).date():
-        return [f"다음 회차였던 **{number}회차**의 마감은 **{label}**이었어요."]
     return [f"다음은 **{number}회차**예요! **{label}**까지 함께 기록해 봐요. 🐾"]
 
 
@@ -450,15 +435,11 @@ def render_message(event, result, now, state):
         remaining = (due - now.astimezone(KST).date()).days
         if remaining == 0:
             lines += [f"**오늘은 {event['round']}회차 회고 마감일이에요! ⏰**"]
-        elif remaining > 0:
-            lines += [f"**{event['round']}회차 회고 마감까지 {remaining}일 남았어요!**"]
         else:
-            lines += [f"**{event['round']}회차 회고 알림을 다시 전해드려요!**",
-                      f"제출 기한은 {deadline}이었어요."]
-        if remaining >= 0:
-            lines += [f"**{deadline}**까지 회고를 올려 주세요."]
+            lines += [f"**{event['round']}회차 회고 마감까지 {remaining}일 남았어요!**"]
+        lines += [f"**{deadline}**까지 회고를 올려 주세요."]
     return "\n".join(lines + [""] + message_tail(
-        result, now, state, closed or due < now.astimezone(KST).date(), due if closed else None))
+        result, now, state, closed, due if closed else None))
 
 
 def render_status(root, now, state):
@@ -525,58 +506,23 @@ def exclusive_lock(root):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
-def already_delivered(state, group, record_id):
-    if group == "manual":
-        record = state.get("manual", {})
-        if record.get("status") == "pending":
-            raise StudyError(f"전송 확인이 필요한 수동 기록이 있습니다: {record['id']}. 운영 문서를 확인하세요.")
-        existing = record.get("status") if record.get("id") == record_id else None
-        if not existing and int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")) > 1:
-            raise StudyError("오래된 수동 실행의 재실행은 지원하지 않습니다. Run workflow로 새로 실행하세요.")
-    else:
-        existing = state["events"].get(record_id)
-    if existing == "sent":
-        print(f"이미 전송됨: {record_id}")
-        return True
-    if existing:
-        raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {record_id}. 운영 문서를 확인하세요.")
-    return False
-
-
-def deliver(root, state, group, record_id, content, persist_changes):
+def deliver(content):
     if not content.strip() or len(content) > 2000:
         raise StudyError("Discord 메시지는 1~2000자여야 합니다.")
-
-    def mark(status):
-        if group == "manual":
-            state["manual"] = {"id": record_id, "status": status}
-        else:
-            state["events"][record_id] = status
-        atomic_json(root / ".study/state.json", state)
-        if persist_changes:
-            persist(root, f"{status} {group} {record_id}")
-
-    mark("pending")
     try:
         send_message(os.environ["DISCORD_WEBHOOK_URL"], content, username=config.BOT_NAME)
     except WebhookError as error:
-        raise StudyError(f"알림 전송을 확인해 주세요: {record_id}. {error}") from None
-    mark("sent")
+        raise StudyError(f"알림 전송을 확인해 주세요. {error}") from None
 
 
-def status(root, now, *, send=False, persist_changes=False, run_id=None):
+def status(root, now, *, send=False, persist_changes=False):
     if persist_changes and not send:
         raise StudyError("--persist는 --send와 함께 사용하세요.")
     if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
         raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
-    record_id = str(run_id or os.environ.get("GITHUB_RUN_ID") or uuid4())
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", record_id):
-        raise StudyError("수동 실행 ID가 올바르지 않습니다.")
     if persist_changes:
         check_checkout(root)
     state = load_state(root)
-    if send and already_delivered(state, "manual", record_id):
-        return
     changes = close_rounds(root, state, now)
     if send:
         changes += sync_folders(root, state, now)
@@ -588,10 +534,10 @@ def status(root, now, *, send=False, persist_changes=False, run_id=None):
     content = render_status(root, now, state)
     print(content)
     if send:
-        deliver(root, state, "manual", record_id, content, persist_changes)
+        deliver(content)
 
 
-def run(root, now, *, send=False, persist_changes=False, event_id=None):
+def run(root, now, *, send=False, persist_changes=False):
     if persist_changes and not send:
         raise StudyError("--persist는 --send와 함께 사용하세요.")
     if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
@@ -600,15 +546,7 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
         check_checkout(root)
     state = load_state(root)
     members, _ = validate_config()
-    events = calendar_events()
-    if event_id:
-        selected = [event for event in events if event["id"] == event_id]
-        if not selected:
-            raise StudyError("등록되지 않은 이벤트입니다. schedule 명령으로 ID를 확인하세요.")
-        if at(selected[0]["scheduled_at"]) > now:
-            raise StudyError("미래 알림은 실제 전송할 수 없습니다.")
-    else:
-        selected = due_events(now, events)
+    selected = due_events(now)
     changes = close_rounds(root, state, now) + sync_folders(root, state, now)
     state_path = root / ".study/state.json"
     atomic_json(state_path, state)
@@ -617,14 +555,12 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
     for change in changes:
         print(change)
     for event in selected:
-        if already_delivered(state, "events", event["id"]):
-            continue
         result = event_result(root, event, members, state)
         content = render_message(event, result, now, state)
         print(content)
         if not send:
             continue
-        deliver(root, state, "events", event["id"], content, persist_changes)
+        deliver(content)
     if not selected:
         print("오늘 예약된 알림이 없습니다. 폴더 동기화를 완료했습니다.")
 
@@ -640,8 +576,6 @@ def main(argv=None):
         if name in ("run", "status"):
             command.add_argument("--send", action="store_true")
             command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
-        if name == "run":
-            command.add_argument("--event", help="누락된 과거 알림 ID 수동 복구")
     args = parser.parse_args(argv)
     try:
         validate_config()
@@ -670,7 +604,7 @@ def main(argv=None):
                 if args.persist:
                     persist(ROOT, "sync participant folders")
             elif args.command == "run":
-                run(ROOT, now, send=args.send, persist_changes=args.persist, event_id=args.event)
+                run(ROOT, now, send=args.send, persist_changes=args.persist)
             elif args.command == "status":
                 status(ROOT, now, send=args.send, persist_changes=args.persist)
         return 0
