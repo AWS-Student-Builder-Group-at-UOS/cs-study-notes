@@ -27,6 +27,8 @@ MEMBERS = [
 ]
 ```
 
+같은 파일의 `MEMBER_EMOJIS`에서 이름별 이모지를 지정합니다. 새 참여자의 이모지가 없으면 `DEFAULT_MEMBER_EMOJI`(`🐾`)를 사용합니다. `BOT_NAME`은 메시지에 표시되는 봇 이름과 인사말에 적용되며, 기본값은 **회고냥**입니다.
+
 `sync`, `run` 또는 `status --send`를 실행하면 다음 규칙으로 폴더를 맞춥니다. `status`, `preview`, `schedule` 미리보기는 파일을 변경하지 않습니다.
 
 - 명단에 있는 사람의 폴더가 없으면 새로 만듭니다.

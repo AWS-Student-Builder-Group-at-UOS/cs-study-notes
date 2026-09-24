@@ -64,14 +64,16 @@ def _retry_delay(body: bytes, headers) -> float:
     return delay
 
 
-def send_message(webhook_url: str, content: str) -> str:
+def send_message(webhook_url: str, content: str, *, username: str) -> str:
     if not isinstance(webhook_url, str) or not _WEBHOOK_URL.fullmatch(webhook_url):
         raise WebhookError("DISCORD_WEBHOOK_URL must be a valid HTTPS Discord webhook URL.")
     if not isinstance(content, str) or not content.strip() or len(content) > 2000:
         raise WebhookError("Discord message content must contain 1 to 2000 characters.")
+    if not isinstance(username, str) or not username.strip() or len(username) > 80:
+        raise WebhookError("Discord username must contain 1 to 80 characters.")
     try:
         body = json.dumps(
-            {"content": content, "allowed_mentions": {"parse": []}},
+            {"username": username, "content": content, "allowed_mentions": {"parse": []}},
             ensure_ascii=False,
         ).encode("utf-8")
     except UnicodeError:

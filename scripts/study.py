@@ -47,6 +47,15 @@ def validate_config():
         raise StudyError("명단에는 경로 문자나 예약 이름을 사용할 수 없습니다.")
     if not members or len({member.casefold() for member in members}) != len(members):
         raise StudyError("MEMBERS에는 중복 없이 한 명 이상을 적어 주세요.")
+    if not isinstance(config.MEMBER_EMOJIS, dict):
+        raise StudyError("MEMBER_EMOJIS에는 이름과 이모지를 짝지어 적어 주세요.")
+    emojis = [config.DEFAULT_MEMBER_EMOJI, *config.MEMBER_EMOJIS.values()]
+    if any(not isinstance(emoji, str) or not 1 <= len(emoji) <= 16
+           or any(char.isspace() for char in emoji) for emoji in emojis):
+        raise StudyError("참여자 이모지는 공백 없이 1~16자로 적어 주세요.")
+    if (not isinstance(config.BOT_NAME, str) or not config.BOT_NAME.strip()
+            or len(config.BOT_NAME) > 80 or any(char in config.BOT_NAME for char in "\r\n")):
+        raise StudyError("BOT_NAME에는 1~80자의 봇 이름을 적어 주세요.")
     try:
         deadlines = [date.fromisoformat(value) for value in config.DEADLINES]
     except (TypeError, ValueError):
@@ -340,8 +349,9 @@ def deadline_label(due, now):
 
 
 def status_lines(result, now, closed=False):
-    lines = [f"{'✓' if item['submitted'] else '✕'} **{item['name']}** · "
-             f"{'제출 완료' if item['submitted'] else '미제출'}" for item in result]
+    lines = [f"- {config.MEMBER_EMOJIS.get(item['name'], config.DEFAULT_MEMBER_EMOJI)} "
+             f"**{item['name']}** · {'제출 완료!' if item['submitted'] else '제출 미완료 ㅠㅠ'}"
+             for item in result]
     count = sum(item["submitted"] for item in result)
     total = len(result)
     if count == total:
@@ -360,7 +370,7 @@ def render_message(event, result, now, revision=None):
     due = date.fromisoformat(event["deadline"])
     deadline = deadline_label(due, now)
     closed = event["kind"] == "final"
-    lines = ["안녕하세요! CS 회고 스터디의 현황 안내봇입니다! 👋", ""]
+    lines = [f"안녕하세요! 여러분의 회고를 챙기는 {config.BOT_NAME}이에요! 🐾", ""]
     if closed:
         lines += [f"**{event['round']}회차 회고가 마감됐어요!**",
                   f"{deadline}까지의 제출 결과를 정리했어요."]
@@ -388,7 +398,7 @@ def render_status(root, now, state):
     event = {"deadline": due.isoformat(), "kind": "final" if ended else "reminder",
              "scheduled_at": datetime.combine(due + timedelta(days=1), time(), KST).isoformat()}
     result, revision = event_result(root, event, members, state)
-    lines = ["안녕하세요! CS 회고 스터디의 현황 안내봇입니다! 👋", ""]
+    lines = [f"안녕하세요! 여러분의 회고를 챙기는 {config.BOT_NAME}이에요! 🐾", ""]
     deadline = deadline_label(due, now)
     if ended:
         lines += [f"모든 회차가 끝났어요! **마지막 {index + 1}회차 결과**를 전해드려요.",
@@ -463,7 +473,8 @@ def deliver(root, state, group, record_id, content, result, revision, now, persi
         # 중복 발송을 막기 위해 전송 전에 예약 상태를 저장합니다.
         persist(root, f"reserve {group} {record_id}")
     try:
-        message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content)
+        message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content,
+                                  username=config.BOT_NAME)
     except WebhookError as error:
         record["error"] = str(error)
         atomic_json(state_path, state)
