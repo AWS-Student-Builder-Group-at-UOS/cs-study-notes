@@ -17,12 +17,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'preview: 미리보기 / sync: 폴더만 / send: 실제 발송'
+        description: 'send: 현황 안내 / preview: 미리보기 / sync: 폴더만 / replay: 예약 알림 복구'
         type: choice
-        options: [preview, sync, send]
-        default: preview
+        options: [send, preview, sync, replay]
+        default: send
       event_id:
-        description: 'send 모드에서 누락된 과거 알림 복구용 ID (보통 비워 둠)'
+        description: 'replay 모드에서만 사용할 과거 예약 알림 ID (그 외에는 비워 둠)'
         type: string
         default: ''
 
@@ -54,18 +54,28 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
       - name: Preview
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'preview'
-        run: python3 scripts/study.py preview
+        run: python3 scripts/study.py status
       - name: Synchronize participant folders
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
         run: python3 scripts/study.py sync --persist
       - name: Send scheduled checklist and persist delivery state
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'send')
+        if: github.event_name == 'schedule'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python3 scripts/study.py run --send --persist
+      - name: Send general study status
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'send'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python3 scripts/study.py status --send --persist
+      - name: Replay a missed scheduled notification
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'replay'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           EVENT_ID: ${{ inputs.event_id }}
         run: |
-          if [ -n "$EVENT_ID" ]; then
-            python3 scripts/study.py run --send --persist --event "$EVENT_ID"
-          else
-            python3 scripts/study.py run --send --persist
+          if [ -z "$EVENT_ID" ]; then
+            echo 'replay 모드에서는 event_id가 필요합니다.' >&2
+            exit 1
           fi
+          python3 scripts/study.py run --send --persist --event "$EVENT_ID"

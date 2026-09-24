@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,6 +137,13 @@ def validate_state(state):
                     or not isinstance(event, dict) or event.get("status") not in ("pending", "sent")):
                 raise ValueError
             date.fromisoformat(event_id.split(":", 1)[0])
+        manual = state.get("manual", {})
+        if not isinstance(manual, dict):
+            raise ValueError
+        for run_id, record in manual.items():
+            if (not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id)
+                    or not isinstance(record, dict) or record.get("status") not in ("pending", "sent")):
+                raise ValueError
     except (ValueError, KeyError, TypeError):
         raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
 
@@ -345,6 +353,37 @@ def render_message(event, result, now, revision=None):
     return "\n".join(lines)
 
 
+def render_status(root, now, state):
+    members, deadlines = validate_config()
+    today = now.astimezone(KST).date()
+    current = next((index for index, due in enumerate(deadlines) if due >= today), None)
+    ended = current is None
+    index = len(deadlines) - 1 if ended else current
+    due = deadlines[index]
+    event = {"deadline": due.isoformat(), "kind": "final" if ended else "reminder",
+             "scheduled_at": datetime.combine(due + timedelta(days=1), time(), KST).isoformat()}
+    result, revision = event_result(root, event, members, state)
+    lines = ["📚 CS 회고 스터디 | 현황 안내", "",
+             "📅 전체 마감 일정 · 매 회차 일요일 23:59 KST",
+             " · ".join(due.isoformat() for due in deadlines), ""]
+    if ended:
+        lines += [f"스터디 종료 · {index + 1}회차 최종 제출 현황", f"마감: {due} 23:59 KST"]
+    else:
+        remaining = "오늘 마감" if due == today else f"D-{(due - today).days}"
+        lines += [f"📝 {index + 1}회차 제출 현황 · {remaining}", f"다음 마감: {due} 23:59 KST"]
+    lines += [""] + [f"{'✅' if item['submitted'] else '⬜'} {item['name']} · "
+                     f"{'제출' if item['submitted'] else '미제출'}" for item in result]
+    lines += ["", f"제출 {sum(item['submitted'] for item in result)}/{len(result)}명"]
+    if ended:
+        lines += ["마감 이전 Git 기록 기준"]
+        if revision:
+            lines += [f"기준 커밋: {revision[:12]}"]
+    else:
+        lines += ["회고 파일: .md · .txt · .html · .pdf"]
+    lines += [f"확인: {now.astimezone(KST):%Y-%m-%d %H:%M} KST", config.REPOSITORY_URL]
+    return "\n".join(lines), result, revision
+
+
 def git(root, *args):
     result = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
@@ -387,6 +426,65 @@ def exclusive_lock(root):
             fcntl.flock(stream, fcntl.LOCK_UN)
 
 
+def already_delivered(state, group, record_id):
+    existing = state.get(group, {}).get(record_id)
+    if not existing:
+        return False
+    if existing["status"] == "sent":
+        print(f"이미 전송됨: {record_id}")
+        return True
+    raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {record_id}. 운영 문서를 확인하세요.")
+
+
+def deliver(root, state, group, record_id, content, result, revision, now, persist_changes):
+    record = {"status": "pending", "reserved_at": now.isoformat(),
+              "members": list(config.MEMBERS), "result": result,
+              "revision": revision, "content": content}
+    state.setdefault(group, {})[record_id] = record
+    state_path = root / ".study/state.json"
+    atomic_json(state_path, state)
+    if persist_changes:
+        # 중복 발송을 막기 위해 전송 전에 예약 상태를 저장합니다.
+        persist(root, f"reserve {group} {record_id}")
+    try:
+        message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content)
+    except WebhookError as error:
+        record["error"] = str(error)
+        atomic_json(state_path, state)
+        if persist_changes:
+            persist(root, f"delivery needs review {group} {record_id}")
+        raise StudyError(f"알림 전송을 확인해 주세요: {record_id}. {error}") from None
+    record.update(status="sent", message_id=message_id, sent_at=datetime.now(KST).isoformat())
+    atomic_json(state_path, state)
+    if persist_changes:
+        persist(root, f"sent {group} {record_id}")
+
+
+def status(root, now, *, send=False, persist_changes=False, run_id=None):
+    if persist_changes and not send:
+        raise StudyError("--persist는 --send와 함께 사용하세요.")
+    if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
+        raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
+    record_id = str(run_id or os.environ.get("GITHUB_RUN_ID") or uuid4())
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", record_id):
+        raise StudyError("수동 실행 ID가 올바르지 않습니다.")
+    if persist_changes:
+        check_checkout(root)
+    state = load_state(root)
+    if send:
+        for change in sync_folders(root, state, now):
+            print(change)
+        atomic_json(root / ".study/state.json", state)
+        if persist_changes:
+            persist(root, "sync participant folders")
+        if already_delivered(state, "manual", record_id):
+            return
+    content, result, revision = render_status(root, now, state)
+    print(content)
+    if send:
+        deliver(root, state, "manual", record_id, content, result, revision, now, persist_changes)
+
+
 def run(root, now, *, send=False, persist_changes=False, event_id=None):
     if persist_changes and not send:
         raise StudyError("--persist는 --send와 함께 사용하세요.")
@@ -413,38 +511,14 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
     for change in changes:
         print(change)
     for event in selected:
-        existing = state["events"].get(event["id"])
-        if existing:
-            if existing["status"] == "sent":
-                print(f"이미 전송됨: {event['id']}")
-                continue
-            raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {event['id']}. 운영 문서를 확인하세요.")
+        if already_delivered(state, "events", event["id"]):
+            continue
         result, revision = event_result(root, event, members, state)
         content = render_message(event, result, now, revision)
         print(content)
         if not send:
             continue
-        state["events"][event["id"]] = {
-            "status": "pending", "reserved_at": now.isoformat(), "members": members,
-            "result": result, "revision": revision, "content": content,
-        }
-        atomic_json(state_path, state)
-        if persist_changes:
-            # 중복 발송을 막기 위해 전송 전에 예약 상태를 저장합니다.
-            persist(root, f"reserve {event['id']}")
-        try:
-            message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content)
-        except WebhookError as error:
-            state["events"][event["id"]]["error"] = str(error)
-            atomic_json(state_path, state)
-            if persist_changes:
-                persist(root, f"delivery needs review {event['id']}")
-            raise StudyError(f"알림 전송을 확인해 주세요: {event['id']}. {error}") from None
-        state["events"][event["id"]].update(status="sent", message_id=message_id,
-            sent_at=datetime.now(KST).isoformat())
-        atomic_json(state_path, state)
-        if persist_changes:
-            persist(root, f"sent {event['id']}")
+        deliver(root, state, "events", event["id"], content, result, revision, now, persist_changes)
     if not selected:
         print("오늘 예약된 알림이 없습니다. 폴더 동기화를 완료했습니다.")
 
@@ -453,13 +527,14 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="CS 회고 스터디 자동화 (기본: 전송하지 않음)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("schedule", help="한국 시간 기준 전체 알림 일정 JSON 출력")
-    for name in ("sync", "preview", "run"):
+    for name in ("sync", "preview", "run", "status"):
         command = sub.add_parser(name)
         if name == "sync":
             command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
-        if name == "run":
+        if name in ("run", "status"):
             command.add_argument("--send", action="store_true")
             command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
+        if name == "run":
             command.add_argument("--event", help="누락된 과거 알림 ID 수동 복구")
     args = parser.parse_args(argv)
     try:
@@ -468,6 +543,9 @@ def main(argv=None):
             print(json.dumps(calendar_events(), ensure_ascii=False, indent=2))
             return 0
         now = datetime.now(KST)
+        if args.command == "status" and not args.send:
+            status(ROOT, now, persist_changes=args.persist)
+            return 0
         if args.command == "preview":
             state = load_state(ROOT)
             for event in due_events(now):
@@ -486,6 +564,8 @@ def main(argv=None):
                     persist(ROOT, "sync participant folders")
             elif args.command == "run":
                 run(ROOT, now, send=args.send, persist_changes=args.persist, event_id=args.event)
+            elif args.command == "status":
+                status(ROOT, now, send=args.send, persist_changes=args.persist)
         return 0
     except (StudyError, SnapshotError, ValueError, OSError) as error:
         print(f"오류: {error}", file=sys.stderr)
