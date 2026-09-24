@@ -420,7 +420,7 @@ def message_tail(result, now, state, closed=False, due=None):
     if fines:
         lines += [""] + fines
     stamp = now.astimezone(KST).strftime("%Y년 %m월 %d일 %H시 %M분")
-    return lines + ["", f"{stamp}(한국 시간) 기준으로 확인한 결과예요!"]
+    return lines + ["", f"{stamp} 기준으로 확인한 결과예요!"]
 
 
 def render_message(event, result, now, state):
