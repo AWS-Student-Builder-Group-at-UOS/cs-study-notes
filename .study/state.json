@@ -8,5 +8,9 @@
     "최진영": "최진영"
   },
   "rounds": {},
-  "events": {}
+  "events": {},
+  "manual": {
+    "id": "35955597417",
+    "status": "pending"
+  }
 }
