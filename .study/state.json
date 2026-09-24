@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "members": {
+    "손수빈": {
+      "folder": "손수빈",
+      "active": true
+    },
+    "황수진": {
+      "folder": "황수진",
+      "active": true
+    },
+    "이예나": {
+      "folder": "이예나",
+      "active": true
+    },
+    "장지원": {
+      "folder": "장지원",
+      "active": true
+    },
+    "최진영": {
+      "folder": "최진영",
+      "active": true
+    }
+  },
+  "events": {}
+}

@@ -1,0 +1,71 @@
+name: Study automation
+
+on:
+  # UTC 15:00 = 다음 날 KST 00:00
+  schedule:
+    - cron: '0 15 30 9 *'
+    - cron: '0 15 1,2,3,4,14,15,16,17,18,28,29,30,31 10 *'
+    - cron: '0 15 1,11,12,13,14,15,25,26,27,28,29 11 *'
+    - cron: '0 15 9,10,11,12,13,23,24,25,26,27 12 *'
+  push:
+    branches: [main]
+    paths:
+      - study_config.py
+      - requirements.txt
+      - scripts/**
+      - .github/workflows/study.yml
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview: 미리보기 / sync: 폴더만 / send: 실제 발송'
+        type: choice
+        options: [preview, sync, send]
+        default: preview
+      event_id:
+        description: 'send 모드에서 누락된 과거 알림 복구용 ID (보통 비워 둠)'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: study-automation-main
+  cancel-in-progress: false
+
+jobs:
+  study:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt
+      - name: Configure automation author
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Preview
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'preview'
+        run: python3 scripts/study.py preview
+      - name: Synchronize participant folders
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
+        run: python3 scripts/study.py sync --persist
+      - name: Send scheduled checklist and persist delivery state
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'send')
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          EVENT_ID: ${{ inputs.event_id }}
+        run: |
+          if [ -n "$EVENT_ID" ]; then
+            python3 scripts/study.py run --send --persist --event "$EVENT_ID"
+          else
+            python3 scripts/study.py run --send --persist
+          fi

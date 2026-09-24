@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import unicodedata
+from zoneinfo import ZoneInfo
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import study_config as config
+from scripts.discord_webhook import WebhookError, send_message
+from scripts.git_snapshot import SnapshotError, snapshot_at, snapshot_revision
+from scripts.submission import has_content
+
+KST = ZoneInfo(config.TIMEZONE)
+RESERVED = {"scripts", "docs", "study_config.py", "README.md"}
+
+
+class StudyError(RuntimeError):
+    pass
+
+
+def safe_name(name):
+    return (isinstance(name, str) and 1 <= len(name) <= 40
+            and re.fullmatch(r"[\w가-힣][\w가-힣 -]*", name) is not None
+            and name.strip() == name
+            and name.casefold() not in {value.casefold() for value in RESERVED}
+            and unicodedata.normalize("NFC", name) == name)
+
+
+def validate_config():
+    if not isinstance(config.MEMBERS, (list, tuple)):
+        raise StudyError("MEMBERS는 이름을 담은 목록이어야 합니다.")
+    members = list(config.MEMBERS)
+    if not all(safe_name(member) for member in members):
+        raise StudyError("명단에는 경로 문자나 예약 이름을 사용할 수 없습니다.")
+    if not members or len({member.casefold() for member in members}) != len(members):
+        raise StudyError("MEMBERS에는 중복 없이 한 명 이상을 적어 주세요.")
+    try:
+        deadlines = [date.fromisoformat(value) for value in config.DEADLINES]
+    except (TypeError, ValueError):
+        raise StudyError("DEADLINES에는 YYYY-MM-DD 날짜를 적어 주세요.") from None
+    if not deadlines or deadlines != sorted(set(deadlines)):
+        raise StudyError("마감일은 중복 없이 오름차순이어야 합니다.")
+    if any(value.weekday() != 6 for value in deadlines):
+        raise StudyError("모든 마감일은 일요일이어야 합니다.")
+    if any((b - a).days != 14 for a, b in zip(deadlines, deadlines[1:])):
+        raise StudyError("마감일은 2주 간격이어야 합니다.")
+    if tuple(config.REMINDER_DAYS) != (3, 2, 1, 0):
+        raise StudyError("REMINDER_DAYS는 (3, 2, 1, 0)이어야 합니다.")
+    if len(members) > 30:
+        raise StudyError("Discord 체크리스트는 최대 30명까지 지원합니다.")
+    return members, deadlines
+
+
+def calendar_events():
+    _, deadlines = validate_config()
+    events = []
+    for index, due in enumerate(deadlines, 1):
+        for days in config.REMINDER_DAYS:
+            scheduled = datetime.combine(due - timedelta(days=days), time(), KST)
+            events.append({"id": f"{due}:d-{days}", "round": index,
+                           "deadline": due.isoformat(), "kind": "reminder", "days_left": days,
+                           "scheduled_at": scheduled.isoformat()})
+        if config.SEND_FINAL_RESULTS:
+            scheduled = datetime.combine(due + timedelta(days=1), time(), KST)
+            events.append({"id": f"{due}:final", "round": index,
+                           "deadline": due.isoformat(), "kind": "final",
+                           "scheduled_at": scheduled.isoformat()})
+    return events
+
+
+def at(value):
+    result = datetime.fromisoformat(value)
+    if result.tzinfo is None:
+        raise StudyError("시각에는 +09:00 같은 시간대를 포함해 주세요.")
+    return result.astimezone(KST)
+
+
+def due_events(now, events=None):
+    return [event for event in (events if events is not None else calendar_events())
+            if at(event["scheduled_at"]) <= now
+            and at(event["scheduled_at"]).date() == now.astimezone(KST).date()]
+
+
+def atomic_json(path, data):
+    if path.is_symlink():
+        raise StudyError("상태 파일은 심볼릭 링크일 수 없습니다.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    if temporary.exists() or temporary.is_symlink():
+        temporary.unlink()
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(data, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def validate_state(state):
+    try:
+        if (not isinstance(state, dict) or type(state["version"]) is not int
+                or state["version"] != 1 or not isinstance(state["members"], dict)
+                or not isinstance(state["events"], dict)):
+            raise ValueError
+        folders = set()
+        names = set()
+        for name, entry in state["members"].items():
+            if not safe_name(name) or not isinstance(entry, dict) or name.casefold() in names:
+                raise ValueError
+            names.add(name.casefold())
+            folder = entry["folder"]
+            if (not isinstance(folder, str) or folder.casefold() in folders
+                    or not isinstance(entry["active"], bool)):
+                raise ValueError
+            if entry["active"]:
+                if folder != name:
+                    raise ValueError
+            elif not re.fullmatch(re.escape(f"[종료] {name}") + r"(?: \([2-9][0-9]*\)| \(1[0-9]+\))?", folder):
+                raise ValueError
+            folders.add(folder.casefold())
+        for event_id, event in state["events"].items():
+            if (not isinstance(event_id, str)
+                    or not re.fullmatch(r"\d{4}-\d{2}-\d{2}:(?:d-[0-3]|final)", event_id)
+                    or not isinstance(event, dict) or event.get("status") not in ("pending", "sent")):
+                raise ValueError
+            date.fromisoformat(event_id.split(":", 1)[0])
+    except (ValueError, KeyError, TypeError):
+        raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
+
+
+def load_state(root):
+    path = root / ".study/state.json"
+    if (root / ".study").is_symlink() or path.is_symlink():
+        raise StudyError(".study는 실제 폴더와 파일이어야 합니다.")
+    if not path.exists():
+        return {"version": 1, "members": {}, "events": {}}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError):
+        raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
+    validate_state(state)
+    return state
+
+
+def ensure_dir(path):
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise StudyError(f"폴더 경로를 확인해 주세요: {path.name}")
+    path.mkdir(exist_ok=True)
+
+
+def sync_folders(root, state, now):
+    members, deadlines = validate_config()
+    validate_state(state)
+    today = now.astimezone(KST).date()
+    changes = []
+    planned_state = deepcopy(state)
+    registry = planned_state["members"]
+    renames, directories, placeholders = [], [], []
+
+    def inspect_directory(path):
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise StudyError(f"폴더 경로를 확인해 주세요: {path.name}")
+        return path.exists()
+
+    def is_round_directory(path):
+        if path.is_symlink() or not path.is_dir() or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", path.name):
+            return False
+        try:
+            date.fromisoformat(path.name)
+        except ValueError:
+            return False
+        return True
+
+    for path in root.iterdir():
+        if (not re.fullmatch(r"[가-힣]{2,10}", path.name) or not safe_name(path.name)
+                or path.is_symlink() or not path.is_dir()):
+            continue
+        if path.name not in registry and any(is_round_directory(child) for child in path.iterdir()):
+            registry[path.name] = {"folder": path.name, "active": True}
+    previous_names = {name.casefold(): name for name in registry}
+    if any(member.casefold() in previous_names and previous_names[member.casefold()] != member
+           for member in members):
+        raise StudyError("이름의 대소문자만 변경할 때에는 기존 폴더와 상태 기록을 함께 수정해 주세요.")
+    destinations = {entry["folder"].casefold() for entry in registry.values()}
+    for name, entry in registry.items():
+        if name not in members and entry["active"]:
+            source = root / entry["folder"]
+            source_exists = inspect_directory(source)
+            archived = f"[종료] {name}"
+            recovered = [path for path in root.iterdir()
+                         if re.fullmatch(re.escape(archived) + r"(?: \([2-9][0-9]*\)| \(1[0-9]+\))?", path.name)]
+            if not source_exists and recovered:
+                if len(recovered) != 1:
+                    raise StudyError(f"종료 폴더 기록을 수동으로 확인해 주세요: {name}")
+                inspect_directory(recovered[0])
+                archived = recovered[0].name
+                changes.append(f"종료 기록 복구: {name} → {archived}")
+            else:
+                sequence = 2
+                while ((root / archived).exists() or (root / archived).is_symlink()
+                       or archived.casefold() in destinations):
+                    archived = f"[종료] {name} ({sequence})"
+                    sequence += 1
+            if source_exists:
+                renames.append((source, root / archived))
+                changes.append(f"종료: {name} → {archived}")
+            destinations.add(archived.casefold())
+            entry.update(folder=archived, active=False)
+    dates_to_create = []
+    for index, due in enumerate(deadlines):
+        if due >= today:
+            dates_to_create.append(due)
+            if due == today and index + 1 < len(deadlines):
+                dates_to_create.append(deadlines[index + 1])
+            break
+    for member in members:
+        folder = root / member
+        source = folder
+        entry = registry.get(member)
+        if entry and not entry["active"]:
+            archived = root / entry["folder"]
+            if inspect_directory(archived):
+                if folder.exists() or folder.is_symlink():
+                    raise StudyError(f"복귀 폴더가 충돌합니다. 수동으로 합쳐 주세요: {member}")
+                source = archived
+                renames.append((archived, folder))
+                changes.append(f"복귀: {member}")
+        exists = inspect_directory(source)
+        if not exists:
+            changes.append(f"참가자 생성: {member}")
+            directories.append(folder)
+        registry[member] = {"folder": member, "active": True}
+        for due in dates_to_create:
+            target = folder / due.isoformat()
+            physical = source / due.isoformat()
+            target_exists = inspect_directory(physical)
+            if not target_exists:
+                changes.append(f"회차 생성: {member}/{due}")
+                directories.append(target)
+            if not target_exists or not any(physical.iterdir()):
+                placeholders.append(target / ".gitkeep")
+        if not dates_to_create and (not exists or not any(source.iterdir())):
+            placeholders.append(folder / ".gitkeep")
+    validate_state(planned_state)
+    completed_renames, created_directories, created_files = [], [], []
+    try:
+        for source, destination in renames:
+            if not inspect_directory(source) or destination.exists() or destination.is_symlink():
+                raise StudyError("동기화 중 폴더 상태가 변경되었습니다. 다시 확인해 주세요.")
+            source.rename(destination)
+            completed_renames.append((source, destination))
+        for path in directories:
+            path.mkdir()
+            created_directories.append(path)
+        for path in placeholders:
+            with path.open("x"):
+                pass
+            created_files.append(path)
+    except (OSError, StudyError):
+        rollback_failed = False
+        for path in reversed(created_files):
+            try:
+                if path.is_symlink() or path.stat().st_size:
+                    raise OSError
+                path.unlink()
+            except OSError:
+                rollback_failed = True
+        for path in reversed(created_directories):
+            try:
+                path.rmdir()
+            except OSError:
+                rollback_failed = True
+        for source, destination in reversed(completed_renames):
+            try:
+                if source.exists() or source.is_symlink():
+                    raise OSError
+                destination.rename(source)
+            except OSError:
+                rollback_failed = True
+        if rollback_failed:
+            raise StudyError("폴더 동기화와 일부 복구가 실패했습니다. 폴더와 상태 기록을 수동으로 확인해 주세요.") from None
+        raise
+    state.clear()
+    state.update(planned_state)
+    return changes
+
+
+def submission_status(root, member, deadline, folder=None):
+    target = root / (folder or member) / deadline
+    if target.parent.is_symlink() or target.is_symlink() or not target.is_dir():
+        return False
+    for base, dirs, files in os.walk(target, followlinks=False):
+        dirs[:] = sorted(name for name in dirs
+                         if not name.startswith(".") and not (Path(base) / name).is_symlink())
+        for name in sorted(files):
+            if not name.startswith(".") and has_content(Path(base) / name):
+                return True
+    return False
+
+
+def event_result(root, event, members, state):
+    if event["kind"] == "final":
+        cutoff = at(event["scheduled_at"])
+        revision = snapshot_revision(root, cutoff)
+        with snapshot_at(root, cutoff) as snapshot:
+            historic = load_state(snapshot)
+            result = []
+            for member in members:
+                folder = historic["members"].get(member, {}).get("folder", member)
+                result.append({"name": member, "submitted": submission_status(
+                    snapshot, member, event["deadline"], folder)})
+        return result, revision
+    return [{"name": member, "submitted": submission_status(root, member, event["deadline"])}
+            for member in members], None
+
+
+def render_message(event, result, now, revision=None):
+    count = sum(item["submitted"] for item in result)
+    title = ("최종 제출 결과" if event["kind"] == "final"
+             else "오늘 마감" if event["days_left"] == 0 else f"마감 D-{event['days_left']}")
+    lines = [f"📚 CS 회고 스터디 · {event['round']}회차 | {title}",
+             f"마감: {event['deadline']} (일) 23:59 KST", ""]
+    lines += [f"{'✅' if item['submitted'] else '⬜'} {item['name']} · "
+              f"{'제출' if item['submitted'] else '미제출'}" for item in result]
+    lines += ["", f"제출 {count}/{len(result)}명"]
+    if event["kind"] == "final":
+        lines += ["마감 이전 Git 기록 기준 · 입금/벌금은 운영자가 확인합니다."]
+        if revision:
+            lines += [f"기준 커밋: {revision[:12]}"]
+    else:
+        lines += ["주제·분량 자유 · 기한 내 내용이 있는 파일을 올려 주세요."]
+    lines += [f"확인: {now.astimezone(KST):%m/%d %H:%M} KST", config.REPOSITORY_URL]
+    return "\n".join(lines)
+
+
+def git(root, *args):
+    result = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        raise StudyError("Git 작업이 실패했습니다. 원격 권한·브랜치·충돌 상태를 확인해 주세요.")
+    return result.stdout.strip()
+
+
+def persist(root, label):
+    git(root, "add", "--all")
+    if git(root, "diff", "--cached", "--name-only"):
+        git(root, "commit", "-m", f"chore(study): {label}")
+    git(root, "push", "origin", "HEAD")
+
+
+def check_checkout(root):
+    if git(root, "status", "--porcelain"):
+        raise StudyError("자동 커밋은 변경 사항이 없는 전용 체크아웃에서 실행해 주세요.")
+    if git(root, "branch", "--show-current") != "main":
+        raise StudyError("자동 커밋은 main 브랜치에서만 실행합니다.")
+    git(root, "fetch", "origin", "main")
+    if git(root, "rev-parse", "HEAD") != git(root, "rev-parse", "FETCH_HEAD"):
+        raise StudyError("원격 main이 변경되었습니다. 최신 코드로 갱신한 뒤 다시 실행하세요.")
+
+
+@contextmanager
+def exclusive_lock(root):
+    ensure_dir(root / ".study")
+    lock_path = root / ".study/run.lock"
+    if lock_path.is_symlink():
+        raise StudyError("실행 잠금 파일이 올바르지 않습니다.")
+    with lock_path.open("a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StudyError("다른 스터디 스크립트가 실행 중입니다.") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def run(root, now, *, send=False, persist_changes=False, event_id=None):
+    if persist_changes and not send:
+        raise StudyError("--persist는 --send와 함께 사용하세요.")
+    if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
+        raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
+    if persist_changes:
+        check_checkout(root)
+    state = load_state(root)
+    members, _ = validate_config()
+    changes = sync_folders(root, state, now)
+    events = calendar_events()
+    if event_id:
+        selected = [event for event in events if event["id"] == event_id]
+        if not selected:
+            raise StudyError("등록되지 않은 이벤트입니다. schedule 명령으로 ID를 확인하세요.")
+        if at(selected[0]["scheduled_at"]) > now:
+            raise StudyError("미래 알림은 실제 전송할 수 없습니다.")
+    else:
+        selected = due_events(now, events)
+    state_path = root / ".study/state.json"
+    atomic_json(state_path, state)
+    if persist_changes:
+        persist(root, "sync participant folders")
+    for change in changes:
+        print(change)
+    for event in selected:
+        existing = state["events"].get(event["id"])
+        if existing:
+            if existing["status"] == "sent":
+                print(f"이미 전송됨: {event['id']}")
+                continue
+            raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {event['id']}. 운영 문서를 확인하세요.")
+        result, revision = event_result(root, event, members, state)
+        content = render_message(event, result, now, revision)
+        print(content)
+        if not send:
+            continue
+        state["events"][event["id"]] = {
+            "status": "pending", "reserved_at": now.isoformat(), "members": members,
+            "result": result, "revision": revision, "content": content,
+        }
+        atomic_json(state_path, state)
+        if persist_changes:
+            # 중복 발송을 막기 위해 전송 전에 예약 상태를 저장합니다.
+            persist(root, f"reserve {event['id']}")
+        try:
+            message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content)
+        except WebhookError as error:
+            state["events"][event["id"]]["error"] = str(error)
+            atomic_json(state_path, state)
+            if persist_changes:
+                persist(root, f"delivery needs review {event['id']}")
+            raise StudyError(f"알림 전송을 확인해 주세요: {event['id']}. {error}") from None
+        state["events"][event["id"]].update(status="sent", message_id=message_id,
+            sent_at=datetime.now(KST).isoformat())
+        atomic_json(state_path, state)
+        if persist_changes:
+            persist(root, f"sent {event['id']}")
+    if not selected:
+        print("오늘 예약된 알림이 없습니다. 폴더 동기화를 완료했습니다.")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="CS 회고 스터디 자동화 (기본: 전송하지 않음)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("schedule", help="한국 시간 기준 전체 알림 일정 JSON 출력")
+    for name in ("sync", "preview", "run"):
+        command = sub.add_parser(name)
+        if name == "sync":
+            command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
+        if name == "run":
+            command.add_argument("--send", action="store_true")
+            command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
+            command.add_argument("--event", help="누락된 과거 알림 ID 수동 복구")
+    args = parser.parse_args(argv)
+    try:
+        validate_config()
+        if args.command == "schedule":
+            print(json.dumps(calendar_events(), ensure_ascii=False, indent=2))
+            return 0
+        now = datetime.now(KST)
+        if args.command == "preview":
+            state = load_state(ROOT)
+            for event in due_events(now):
+                result, revision = event_result(ROOT, event, list(config.MEMBERS), state)
+                print(render_message(event, result, now, revision))
+            return 0
+        with exclusive_lock(ROOT):
+            if args.command == "sync":
+                state = load_state(ROOT)
+                if args.persist:
+                    check_checkout(ROOT)
+                for change in sync_folders(ROOT, state, now):
+                    print(change)
+                atomic_json(ROOT / ".study/state.json", state)
+                if args.persist:
+                    persist(ROOT, "sync participant folders")
+            elif args.command == "run":
+                run(ROOT, now, send=args.send, persist_changes=args.persist, event_id=args.event)
+        return 0
+    except (StudyError, SnapshotError, ValueError, OSError) as error:
+        print(f"오류: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
