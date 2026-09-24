@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from copy import deepcopy
 from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import study_config as config
 from scripts.discord_webhook import WebhookError, send_message
-from scripts.git_snapshot import SnapshotError, snapshot_at, snapshot_revision
+from scripts.git_snapshot import SnapshotError, snapshot_at
 from scripts.submission import has_content
 
 KST = ZoneInfo(config.TIMEZONE)
@@ -56,6 +57,8 @@ def validate_config():
     if (not isinstance(config.BOT_NAME, str) or not config.BOT_NAME.strip()
             or len(config.BOT_NAME) > 80 or any(char in config.BOT_NAME for char in "\r\n")):
         raise StudyError("BOT_NAME에는 1~80자의 봇 이름을 적어 주세요.")
+    if type(config.MISSED_SUBMISSION_FINE) is not int or config.MISSED_SUBMISSION_FINE <= 0:
+        raise StudyError("MISSED_SUBMISSION_FINE에는 양의 정수 금액을 적어 주세요.")
     try:
         deadlines = [date.fromisoformat(value) for value in config.DEADLINES]
     except (TypeError, ValueError):
@@ -121,37 +124,39 @@ def atomic_json(path, data):
 def validate_state(state):
     try:
         if (not isinstance(state, dict) or type(state["version"]) is not int
-                or state["version"] != 1 or not isinstance(state["members"], dict)
-                or not isinstance(state["events"], dict)):
+                or state["version"] != 2 or not isinstance(state["members"], dict)
+                or not isinstance(state["events"], dict) or not isinstance(state["rounds"], dict)):
             raise ValueError
         folders = set()
         names = set()
-        for name, entry in state["members"].items():
-            if not safe_name(name) or not isinstance(entry, dict) or name.casefold() in names:
+        for name, folder in state["members"].items():
+            if not safe_name(name) or name.casefold() in names:
                 raise ValueError
             names.add(name.casefold())
-            folder = entry["folder"]
-            if (not isinstance(folder, str) or folder.casefold() in folders
-                    or not isinstance(entry["active"], bool)):
+            if not isinstance(folder, str) or folder.casefold() in folders:
                 raise ValueError
-            if entry["active"]:
-                if folder != name:
-                    raise ValueError
-            elif not re.fullmatch(re.escape(f"[종료] {name}") + r"(?: \([2-9][0-9]*\)| \(1[0-9]+\))?", folder):
+            if folder != name and not re.fullmatch(re.escape(f"[종료] {name}") + r"(?: \([2-9][0-9]*\)| \(1[0-9]+\))?", folder):
                 raise ValueError
             folders.add(folder.casefold())
         for event_id, event in state["events"].items():
             if (not isinstance(event_id, str)
                     or not re.fullmatch(r"\d{4}-\d{2}-\d{2}:(?:d-[0-3]|final)", event_id)
-                    or not isinstance(event, dict) or event.get("status") not in ("pending", "sent")):
+                    or event not in ("pending", "sent")):
                 raise ValueError
             date.fromisoformat(event_id.split(":", 1)[0])
         manual = state.get("manual", {})
         if not isinstance(manual, dict):
             raise ValueError
-        for run_id, record in manual.items():
-            if (not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id)
-                    or not isinstance(record, dict) or record.get("status") not in ("pending", "sent")):
+        if manual and (not isinstance(manual.get("id"), str)
+                       or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", manual["id"])
+                       or manual.get("status") not in ("pending", "sent")):
+            raise ValueError
+        for deadline, record in state["rounds"].items():
+            date.fromisoformat(deadline)
+            if (not isinstance(record, dict) or type(record["fine"]) is not int or record["fine"] <= 0
+                    or not isinstance(record["results"], dict) or not record["results"]
+                    or any(not safe_name(name) or type(submitted) is not bool
+                           for name, submitted in record["results"].items())):
                 raise ValueError
     except (ValueError, KeyError, TypeError):
         raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
@@ -162,10 +167,14 @@ def load_state(root):
     if (root / ".study").is_symlink() or path.is_symlink():
         raise StudyError(".study는 실제 폴더와 파일이어야 합니다.")
     if not path.exists():
-        return {"version": 1, "members": {}, "events": {}}
+        return {"version": 2, "members": {}, "rounds": {}, "events": {}}
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
-    except (ValueError, UnicodeError):
+        if isinstance(state, dict) and state.get("version") == 1:
+            state = {"version": 2,
+                     "members": {name: entry["folder"] for name, entry in state["members"].items()},
+                     "rounds": {}, "events": {key: entry["status"] for key, entry in state["events"].items()}}
+    except (ValueError, UnicodeError, KeyError, TypeError, AttributeError):
         raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
     validate_state(state)
     return state
@@ -205,15 +214,15 @@ def sync_folders(root, state, now):
                 or path.is_symlink() or not path.is_dir()):
             continue
         if path.name not in registry and any(is_round_directory(child) for child in path.iterdir()):
-            registry[path.name] = {"folder": path.name, "active": True}
+            registry[path.name] = path.name
     previous_names = {name.casefold(): name for name in registry}
     if any(member.casefold() in previous_names and previous_names[member.casefold()] != member
            for member in members):
         raise StudyError("이름의 대소문자만 변경할 때에는 기존 폴더와 상태 기록을 함께 수정해 주세요.")
-    destinations = {entry["folder"].casefold() for entry in registry.values()}
-    for name, entry in registry.items():
-        if name not in members and entry["active"]:
-            source = root / entry["folder"]
+    destinations = {folder.casefold() for folder in registry.values()}
+    for name, folder in registry.items():
+        if name not in members and folder == name:
+            source = root / folder
             source_exists = inspect_directory(source)
             archived = f"[종료] {name}"
             recovered = [path for path in root.iterdir()
@@ -234,7 +243,7 @@ def sync_folders(root, state, now):
                 renames.append((source, root / archived))
                 changes.append(f"종료: {name} → {archived}")
             destinations.add(archived.casefold())
-            entry.update(folder=archived, active=False)
+            registry[name] = archived
     dates_to_create = []
     for index, due in enumerate(deadlines):
         if due >= today:
@@ -245,9 +254,9 @@ def sync_folders(root, state, now):
     for member in members:
         folder = root / member
         source = folder
-        entry = registry.get(member)
-        if entry and not entry["active"]:
-            archived = root / entry["folder"]
+        previous_folder = registry.get(member)
+        if previous_folder and previous_folder != member:
+            archived = root / previous_folder
             if inspect_directory(archived):
                 if folder.exists() or folder.is_symlink():
                     raise StudyError(f"복귀 폴더가 충돌합니다. 수동으로 합쳐 주세요: {member}")
@@ -258,7 +267,7 @@ def sync_folders(root, state, now):
         if not exists:
             changes.append(f"참가자 생성: {member}")
             directories.append(folder)
-        registry[member] = {"folder": member, "active": True}
+        registry[member] = member
         for due in dates_to_create:
             target = folder / due.isoformat()
             physical = source / due.isoformat()
@@ -327,20 +336,48 @@ def submission_status(root, member, deadline, folder=None):
     return False
 
 
-def event_result(root, event, members, state):
-    if event["kind"] == "final":
-        cutoff = at(event["scheduled_at"])
-        revision = snapshot_revision(root, cutoff)
+def close_rounds(root, state, now):
+    _, deadlines = validate_config()
+    closed = {}
+    for due in deadlines:
+        if due >= now.astimezone(KST).date() or due.isoformat() in state["rounds"]:
+            continue
+        cutoff = datetime.combine(due + timedelta(days=1), time(), KST)
         with snapshot_at(root, cutoff) as snapshot:
+            try:
+                tree = ast.parse((snapshot / "study_config.py").read_text(encoding="utf-8"))
+                members = next(ast.literal_eval(node.value) for node in tree.body
+                               if isinstance(node, ast.Assign)
+                               and any(isinstance(target, ast.Name) and target.id == "MEMBERS"
+                                       for target in node.targets))
+                fine = next((ast.literal_eval(node.value) for node in tree.body
+                             if isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Name) and target.id == "MISSED_SUBMISSION_FINE"
+                                     for target in node.targets)), 10_000)
+                if (not isinstance(members, (list, tuple)) or not members
+                        or not all(safe_name(name) for name in members)
+                        or len({name.casefold() for name in members}) != len(members)
+                        or type(fine) is not int or fine <= 0):
+                    raise ValueError
+            except (OSError, SyntaxError, ValueError, TypeError, StopIteration):
+                raise StudyError(f"{due} 마감 당시 명단을 확인할 수 없습니다.") from None
             historic = load_state(snapshot)
-            result = []
-            for member in members:
-                folder = historic["members"].get(member, {}).get("folder", member)
-                result.append({"name": member, "submitted": submission_status(
-                    snapshot, member, event["deadline"], folder)})
-        return result, revision
+            results = {name: submission_status(snapshot, name, due.isoformat(),
+                       historic["members"].get(name, name)) for name in members}
+        closed[due.isoformat()] = {"results": results, "fine": fine}
+    state["rounds"].update(closed)
+    return [f"마감 확정: {due}" for due in closed]
+
+
+def event_result(root, event, members, state):
+    record = state["rounds"].get(event["deadline"])
+    if record:
+        return [{"name": name, "submitted": submitted}
+                for name, submitted in record["results"].items()]
+    if event["kind"] == "final":
+        raise StudyError("확정된 마감 결과가 없습니다.")
     return [{"name": member, "submitted": submission_status(root, member, event["deadline"])}
-            for member in members], None
+            for member in members]
 
 
 def deadline_label(due, now):
@@ -362,11 +399,46 @@ def status_lines(result, now, closed=False):
         summary = f"현재 **0/{total}명** 제출! 첫 회고를 기다릴게요. ✍️"
     else:
         summary = f"지금까지 **{count}/{total}명**이 제출했어요. 남은 회고도 기다릴게요! ✍️"
+    return lines + ["", summary]
+
+
+def fine_lines(state):
+    fines = {name: {"count": 0, "amount": 0} for name in config.MEMBERS}
+    for record in state["rounds"].values():
+        for name, submitted in record["results"].items():
+            if name in fines and not submitted:
+                fines[name]["amount"] += record["fine"]
+                fines[name]["count"] += 1
+    lines = [f"- {config.MEMBER_EMOJIS.get(name, config.DEFAULT_MEMBER_EMOJI)} "
+             f"**{name}** · 누적 **{fine['amount']:,}원** ({fine['count']}회)"
+             for name, fine in fines.items() if fine["count"]]
+    return ["💰 현재 참여자의 누적 벌금이에요!"] + lines if lines else []
+
+
+def next_round_lines(due, now):
+    _, deadlines = validate_config()
+    next_due = next((value for value in deadlines if value > due), None)
+    if next_due is None:
+        return ["이번이 마지막 회차였어요. 끝까지 함께해 주셔서 고마워요! 🐾"]
+    number = deadlines.index(next_due) + 1
+    label = deadline_label(next_due, now)
+    if next_due < now.astimezone(KST).date():
+        return [f"다음 회차였던 **{number}회차**의 마감은 **{label}**이었어요."]
+    return [f"다음은 **{number}회차**예요! **{label}**까지 함께 기록해 봐요. 🐾"]
+
+
+def message_tail(result, now, state, closed=False, due=None):
+    lines = status_lines(result, now, closed)
+    if due is not None:
+        lines += [""] + next_round_lines(due, now)
+    fines = fine_lines(state)
+    if fines:
+        lines += [""] + fines
     stamp = now.astimezone(KST).strftime("%Y년 %m월 %d일 %H시 %M분")
-    return lines + ["", summary, "", f"{stamp}(한국 시간) 기준으로 확인한 결과예요!"]
+    return lines + ["", f"{stamp}(한국 시간) 기준으로 확인한 결과예요!"]
 
 
-def render_message(event, result, now, revision=None):
+def render_message(event, result, now, state):
     due = date.fromisoformat(event["deadline"])
     deadline = deadline_label(due, now)
     closed = event["kind"] == "final"
@@ -385,7 +457,8 @@ def render_message(event, result, now, revision=None):
                       f"제출 기한은 {deadline}이었어요."]
         if remaining >= 0:
             lines += [f"**{deadline}**까지 회고를 올려 주세요."]
-    return "\n".join(lines + [""] + status_lines(result, now, closed))
+    return "\n".join(lines + [""] + message_tail(
+        result, now, state, closed or due < now.astimezone(KST).date(), due if closed else None))
 
 
 def render_status(root, now, state):
@@ -397,7 +470,7 @@ def render_status(root, now, state):
     due = deadlines[index]
     event = {"deadline": due.isoformat(), "kind": "final" if ended else "reminder",
              "scheduled_at": datetime.combine(due + timedelta(days=1), time(), KST).isoformat()}
-    result, revision = event_result(root, event, members, state)
+    result = event_result(root, event, members, state)
     lines = [f"안녕하세요! 여러분의 회고를 챙기는 {config.BOT_NAME}이에요! 🐾", ""]
     deadline = deadline_label(due, now)
     if ended:
@@ -407,7 +480,7 @@ def render_status(root, now, state):
         lines += [f"**{index + 1}회차 회고는 {deadline}까지예요.**"]
         lines += ["오늘 마감이에요! 잊지 말고 회고를 올려 주세요. ⏰" if due == today
                   else f"마감까지 {(due - today).days}일 남았어요. 이번에도 함께 기록해 봐요!"]
-    return "\n".join(lines + [""] + status_lines(result, now, ended)), result, revision
+    return "\n".join(lines + [""] + message_tail(result, now, state, ended))
 
 
 def git(root, *args):
@@ -453,38 +526,42 @@ def exclusive_lock(root):
 
 
 def already_delivered(state, group, record_id):
-    existing = state.get(group, {}).get(record_id)
-    if not existing:
-        return False
-    if existing["status"] == "sent":
+    if group == "manual":
+        record = state.get("manual", {})
+        if record.get("status") == "pending":
+            raise StudyError(f"전송 확인이 필요한 수동 기록이 있습니다: {record['id']}. 운영 문서를 확인하세요.")
+        existing = record.get("status") if record.get("id") == record_id else None
+        if not existing and int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")) > 1:
+            raise StudyError("오래된 수동 실행의 재실행은 지원하지 않습니다. Run workflow로 새로 실행하세요.")
+    else:
+        existing = state["events"].get(record_id)
+    if existing == "sent":
         print(f"이미 전송됨: {record_id}")
         return True
-    raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {record_id}. 운영 문서를 확인하세요.")
+    if existing:
+        raise StudyError(f"전송 확인이 필요한 기록이 있습니다: {record_id}. 운영 문서를 확인하세요.")
+    return False
 
 
-def deliver(root, state, group, record_id, content, result, revision, now, persist_changes):
-    record = {"status": "pending", "reserved_at": now.isoformat(),
-              "members": list(config.MEMBERS), "result": result,
-              "revision": revision, "content": content}
-    state.setdefault(group, {})[record_id] = record
-    state_path = root / ".study/state.json"
-    atomic_json(state_path, state)
-    if persist_changes:
-        # 중복 발송을 막기 위해 전송 전에 예약 상태를 저장합니다.
-        persist(root, f"reserve {group} {record_id}")
-    try:
-        message_id = send_message(os.environ["DISCORD_WEBHOOK_URL"], content,
-                                  username=config.BOT_NAME)
-    except WebhookError as error:
-        record["error"] = str(error)
-        atomic_json(state_path, state)
+def deliver(root, state, group, record_id, content, persist_changes):
+    if not content.strip() or len(content) > 2000:
+        raise StudyError("Discord 메시지는 1~2000자여야 합니다.")
+
+    def mark(status):
+        if group == "manual":
+            state["manual"] = {"id": record_id, "status": status}
+        else:
+            state["events"][record_id] = status
+        atomic_json(root / ".study/state.json", state)
         if persist_changes:
-            persist(root, f"delivery needs review {group} {record_id}")
+            persist(root, f"{status} {group} {record_id}")
+
+    mark("pending")
+    try:
+        send_message(os.environ["DISCORD_WEBHOOK_URL"], content, username=config.BOT_NAME)
+    except WebhookError as error:
         raise StudyError(f"알림 전송을 확인해 주세요: {record_id}. {error}") from None
-    record.update(status="sent", message_id=message_id, sent_at=datetime.now(KST).isoformat())
-    atomic_json(state_path, state)
-    if persist_changes:
-        persist(root, f"sent {group} {record_id}")
+    mark("sent")
 
 
 def status(root, now, *, send=False, persist_changes=False, run_id=None):
@@ -498,18 +575,20 @@ def status(root, now, *, send=False, persist_changes=False, run_id=None):
     if persist_changes:
         check_checkout(root)
     state = load_state(root)
+    if send and already_delivered(state, "manual", record_id):
+        return
+    changes = close_rounds(root, state, now)
     if send:
-        for change in sync_folders(root, state, now):
+        changes += sync_folders(root, state, now)
+        for change in changes:
             print(change)
         atomic_json(root / ".study/state.json", state)
         if persist_changes:
-            persist(root, "sync participant folders")
-        if already_delivered(state, "manual", record_id):
-            return
-    content, result, revision = render_status(root, now, state)
+            persist(root, "sync study records")
+    content = render_status(root, now, state)
     print(content)
     if send:
-        deliver(root, state, "manual", record_id, content, result, revision, now, persist_changes)
+        deliver(root, state, "manual", record_id, content, persist_changes)
 
 
 def run(root, now, *, send=False, persist_changes=False, event_id=None):
@@ -521,7 +600,6 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
         check_checkout(root)
     state = load_state(root)
     members, _ = validate_config()
-    changes = sync_folders(root, state, now)
     events = calendar_events()
     if event_id:
         selected = [event for event in events if event["id"] == event_id]
@@ -531,6 +609,7 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
             raise StudyError("미래 알림은 실제 전송할 수 없습니다.")
     else:
         selected = due_events(now, events)
+    changes = close_rounds(root, state, now) + sync_folders(root, state, now)
     state_path = root / ".study/state.json"
     atomic_json(state_path, state)
     if persist_changes:
@@ -540,12 +619,12 @@ def run(root, now, *, send=False, persist_changes=False, event_id=None):
     for event in selected:
         if already_delivered(state, "events", event["id"]):
             continue
-        result, revision = event_result(root, event, members, state)
-        content = render_message(event, result, now, revision)
+        result = event_result(root, event, members, state)
+        content = render_message(event, result, now, state)
         print(content)
         if not send:
             continue
-        deliver(root, state, "events", event["id"], content, result, revision, now, persist_changes)
+        deliver(root, state, "events", event["id"], content, persist_changes)
     if not selected:
         print("오늘 예약된 알림이 없습니다. 폴더 동기화를 완료했습니다.")
 
@@ -575,16 +654,17 @@ def main(argv=None):
             return 0
         if args.command == "preview":
             state = load_state(ROOT)
+            close_rounds(ROOT, state, now)
             for event in due_events(now):
-                result, revision = event_result(ROOT, event, list(config.MEMBERS), state)
-                print(render_message(event, result, now, revision))
+                result = event_result(ROOT, event, list(config.MEMBERS), state)
+                print(render_message(event, result, now, state))
             return 0
         with exclusive_lock(ROOT):
             if args.command == "sync":
                 state = load_state(ROOT)
                 if args.persist:
                     check_checkout(ROOT)
-                for change in sync_folders(ROOT, state, now):
+                for change in close_rounds(ROOT, state, now) + sync_folders(ROOT, state, now):
                     print(change)
                 atomic_json(ROOT / ".study/state.json", state)
                 if args.persist:
