@@ -14,4 +14,3 @@ DEADLINES = (
 TIMEZONE = "Asia/Seoul"
 REMINDER_DAYS = (3, 2, 1, 0)
 SEND_FINAL_RESULTS = True
-REPOSITORY_URL = "https://github.com/AWS-Student-Builder-Group-at-UOS/cs-study-notes"

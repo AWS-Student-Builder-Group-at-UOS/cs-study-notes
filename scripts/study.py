@@ -334,23 +334,48 @@ def event_result(root, event, members, state):
             for member in members], None
 
 
-def render_message(event, result, now, revision=None):
+def deadline_label(due, now):
+    year = f"{due.year}년 " if due.year != now.astimezone(KST).year else ""
+    return f"{year}{due.month}월 {due.day}일(일) 밤 11시 59분"
+
+
+def status_lines(result, now, closed=False):
+    lines = [f"{'✅' if item['submitted'] else '⏳'} {item['name']} · "
+             f"{'제출 완료' if item['submitted'] else '미제출'}" for item in result]
     count = sum(item["submitted"] for item in result)
-    title = ("최종 제출 결과" if event["kind"] == "final"
-             else "오늘 마감" if event["days_left"] == 0 else f"마감 D-{event['days_left']}")
-    lines = [f"📚 CS 회고 스터디 · {event['round']}회차 | {title}",
-             f"마감: {event['deadline']} (일) 23:59 KST", ""]
-    lines += [f"{'✅' if item['submitted'] else '⬜'} {item['name']} · "
-              f"{'제출' if item['submitted'] else '미제출'}" for item in result]
-    lines += ["", f"제출 {count}/{len(result)}명"]
-    if event["kind"] == "final":
-        lines += ["마감 이전 Git 기록 기준 · 입금/벌금은 운영자가 확인합니다."]
-        if revision:
-            lines += [f"기준 커밋: {revision[:12]}"]
+    total = len(result)
+    if count == total:
+        summary = f"**{total}명 모두 제출 완료!** 수고하셨어요! 🎉"
+    elif closed:
+        summary = f"이번 회차는 **{count}/{total}명**이 제출했어요. 모두 수고하셨어요! 🙌"
+    elif count == 0:
+        summary = f"현재 **0/{total}명** 제출! 첫 회고를 기다릴게요. ✍️"
     else:
-        lines += ["주제·분량 자유 · 기한 내 내용이 있는 파일을 올려 주세요."]
-    lines += [f"확인: {now.astimezone(KST):%m/%d %H:%M} KST", config.REPOSITORY_URL]
-    return "\n".join(lines)
+        summary = f"지금까지 **{count}/{total}명**이 제출했어요. 남은 회고도 기다릴게요! ✍️"
+    stamp = now.astimezone(KST).strftime("%Y년 %m월 %d일 %H시 %M분")
+    return lines + ["", summary, "", f"{stamp}(한국 시간) 기준으로 확인한 결과예요!"]
+
+
+def render_message(event, result, now, revision=None):
+    due = date.fromisoformat(event["deadline"])
+    deadline = deadline_label(due, now)
+    closed = event["kind"] == "final"
+    lines = ["안녕하세요! CS 회고 스터디의 현황 안내봇입니다! 👋", ""]
+    if closed:
+        lines += [f"**{event['round']}회차 회고가 마감됐어요!**",
+                  f"{deadline}까지의 제출 결과를 정리했어요."]
+    else:
+        remaining = (due - now.astimezone(KST).date()).days
+        if remaining == 0:
+            lines += [f"**오늘은 {event['round']}회차 회고 마감일이에요! ⏰**"]
+        elif remaining > 0:
+            lines += [f"**{event['round']}회차 회고 마감까지 {remaining}일 남았어요!**"]
+        else:
+            lines += [f"**{event['round']}회차 회고 알림을 다시 전해드려요!**",
+                      f"제출 기한은 {deadline}이었어요."]
+        if remaining >= 0:
+            lines += [f"**{deadline}**까지 회고를 올려 주세요."]
+    return "\n".join(lines + [""] + status_lines(result, now, closed))
 
 
 def render_status(root, now, state):
@@ -363,25 +388,16 @@ def render_status(root, now, state):
     event = {"deadline": due.isoformat(), "kind": "final" if ended else "reminder",
              "scheduled_at": datetime.combine(due + timedelta(days=1), time(), KST).isoformat()}
     result, revision = event_result(root, event, members, state)
-    lines = ["📚 CS 회고 스터디 | 현황 안내", "",
-             "📅 전체 마감 일정 · 매 회차 일요일 23:59 KST",
-             " · ".join(due.isoformat() for due in deadlines), ""]
+    lines = ["안녕하세요! CS 회고 스터디의 현황 안내봇입니다! 👋", ""]
+    deadline = deadline_label(due, now)
     if ended:
-        lines += [f"스터디 종료 · {index + 1}회차 최종 제출 현황", f"마감: {due} 23:59 KST"]
+        lines += [f"모든 회차가 끝났어요! **마지막 {index + 1}회차 결과**를 전해드려요.",
+                  f"{deadline}까지의 제출 결과예요."]
     else:
-        remaining = "오늘 마감" if due == today else f"D-{(due - today).days}"
-        lines += [f"📝 {index + 1}회차 제출 현황 · {remaining}", f"다음 마감: {due} 23:59 KST"]
-    lines += [""] + [f"{'✅' if item['submitted'] else '⬜'} {item['name']} · "
-                     f"{'제출' if item['submitted'] else '미제출'}" for item in result]
-    lines += ["", f"제출 {sum(item['submitted'] for item in result)}/{len(result)}명"]
-    if ended:
-        lines += ["마감 이전 Git 기록 기준"]
-        if revision:
-            lines += [f"기준 커밋: {revision[:12]}"]
-    else:
-        lines += ["회고 파일: .md · .txt · .html · .pdf"]
-    lines += [f"확인: {now.astimezone(KST):%Y-%m-%d %H:%M} KST", config.REPOSITORY_URL]
-    return "\n".join(lines), result, revision
+        lines += [f"**{index + 1}회차 회고는 {deadline}까지예요.**"]
+        lines += ["오늘 마감이에요! 잊지 말고 회고를 올려 주세요. ⏰" if due == today
+                  else f"마감까지 {(due - today).days}일 남았어요. 이번에도 함께 기록해 봐요!"]
+    return "\n".join(lines + [""] + status_lines(result, now, ended)), result, revision
 
 
 def git(root, *args):
