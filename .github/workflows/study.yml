@@ -1,12 +1,18 @@
 name: Study automation
 
 on:
-  # UTC 15:00 = 다음 날 KST 00:00
   schedule:
-    - cron: '0 15 30 9 *'
-    - cron: '0 15 1,2,3,4,14,15,16,17,18,28,29,30,31 10 *'
-    - cron: '0 15 1,11,12,13,14,15,25,26,27,28,29 11 *'
-    - cron: '0 15 9,10,11,12,13,23,24,25,26,27 12 *'
+    # KST 09:00: 일주일 전·3일 전·당일 리마인드
+    - cron: '0 0 27 9 *'
+    - cron: '0 0 1,4,11,15,18,25,29 10 *'
+    - cron: '0 0 1,8,12,15,22,26,29 11 *'
+    - cron: '0 0 6,10,13,20,24,27 12 *'
+    # 마감 다음 날 KST 00:00: 최종 결과
+    - cron: '0 15 4,18 10 *'
+    - cron: '0 15 1,15,29 11 *'
+    - cron: '0 15 13,27 12 *'
+    # 일요일 KST 00:00: 폴더 관리만 수행
+    - cron: '0 15 * 10-12 6'
   push:
     branches: [main]
     paths:
@@ -54,10 +60,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'preview'
         run: python3 scripts/study.py status
       - name: Synchronize participant folders
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync') || (github.event_name == 'schedule' && github.event.schedule == '0 15 * 10-12 6')
         run: python3 scripts/study.py sync --persist
       - name: Send scheduled study status
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && github.event.schedule != '0 15 * 10-12 6'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python3 scripts/study.py run --send --persist
