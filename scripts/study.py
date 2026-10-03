@@ -68,8 +68,8 @@ def validate_config():
         raise StudyError("모든 마감일은 일요일이어야 합니다.")
     if any((b - a).days != 14 for a, b in zip(deadlines, deadlines[1:])):
         raise StudyError("마감일은 2주 간격이어야 합니다.")
-    if tuple(config.REMINDER_DAYS) != (7, 3, 0):
-        raise StudyError("REMINDER_DAYS는 (7, 3, 0)이어야 합니다.")
+    if tuple(config.REMINDER_DAYS) != (7, 3, 1, 0):
+        raise StudyError("REMINDER_DAYS는 (7, 3, 1, 0)이어야 합니다.")
     if type(config.REMINDER_HOUR) is not int or not 0 <= config.REMINDER_HOUR <= 23:
         raise StudyError("REMINDER_HOUR에는 0~23 사이의 정수를 적어 주세요.")
     if len(members) > 30:
