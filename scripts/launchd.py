@@ -79,7 +79,7 @@ def configure_secrets():
     values = {"DISCORD_WEBHOOK_URL": url}
     if token:
         values["GITHUB_TOKEN"] = token
-    with SECRETS.open("x", encoding="utf-8", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
+    with open(SECRETS, "x", encoding="utf-8", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
         json.dump(values, stream)
         stream.write("\n")
 
