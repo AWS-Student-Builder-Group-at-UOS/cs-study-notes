@@ -7,18 +7,17 @@ on:
     - cron: '0 0 1,3,4,11,15,17,18,25,29,31 10 *'
     - cron: '0 0 1,8,12,14,15,22,26,28,29 11 *'
     - cron: '0 0 6,10,12,13,20,24,26,27 12 *'
-    # 마감 다음 날 KST 00:00: 최종 결과
+    # 마감 다음 날 KST 00:00: 최종 결과 및 다음 회차 폴더 생성
     - cron: '0 15 4,18 10 *'
     - cron: '0 15 1,15,29 11 *'
     - cron: '0 15 13,27 12 *'
-    # 일요일 KST 00:00: 폴더 관리만 수행
-    - cron: '0 15 * 10-12 6'
   push:
     branches: [main]
     paths:
       - study_config.py
       - requirements.txt
       - scripts/**
+      - tests/**
       - .github/workflows/study.yml
   workflow_dispatch:
     inputs:
@@ -52,6 +51,8 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python3 -m pip install -r requirements.txt
+      - name: Test study automation
+        run: python3 -m unittest discover -s tests
       - name: Configure automation author
         run: |
           git config user.name 'github-actions[bot]'
@@ -60,10 +61,10 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'preview'
         run: python3 scripts/study.py status
       - name: Synchronize participant folders
-        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync') || (github.event_name == 'schedule' && github.event.schedule == '0 15 * 10-12 6')
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'sync')
         run: python3 scripts/study.py sync --persist
       - name: Send scheduled study status
-        if: github.event_name == 'schedule' && github.event.schedule != '0 15 * 10-12 6'
+        if: github.event_name == 'schedule'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python3 scripts/study.py run --send --persist

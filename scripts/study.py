@@ -234,11 +234,9 @@ def sync_folders(root, state, now):
             destinations.add(archived.casefold())
             registry[name] = archived
     dates_to_create = []
-    for index, due in enumerate(deadlines):
+    for due in deadlines:
         if due >= today:
             dates_to_create.append(due)
-            if due == today and index + 1 < len(deadlines):
-                dates_to_create.append(deadlines[index + 1])
             break
     for member in members:
         folder = root / member
