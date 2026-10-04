@@ -536,7 +536,7 @@ def synchronize(root, state, now):
         print(change)
 
 
-def run(root, now, *, kind, send=False, persist_changes=False):
+def run(root, now, *, kind, send=False, persist_changes=False, submission_root=None):
     if persist_changes and (not send or kind != "final"):
         raise StudyError("--persist는 run --kind final --send에서만 사용하세요.")
     store = DeliveryStore(root)
@@ -573,7 +573,7 @@ def run(root, now, *, kind, send=False, persist_changes=False):
     delivery_error = None
     try:
         for event in selected:
-            result = event_result(root, event, list(config.MEMBERS), state)
+            result = event_result(submission_root or root, event, list(config.MEMBERS), state)
             content = render_message(event, result, now, state)
             if send:
                 store.send(data, event, now, lambda: deliver(content))

@@ -45,8 +45,6 @@ def github_repository(root: Path) -> Optional[str]:
         repository = match.group(1) if match else None
     if repository and not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise SnapshotError("GitHub repository name is invalid.")
-    if os.environ.get("GITHUB_ACTIONS") == "true" and not repository:
-        raise SnapshotError("GitHub repository is required to verify the submission deadline.")
     return repository
 
 
@@ -228,11 +226,16 @@ def _materialize(root: Path, revision: str, destination: Path) -> None:
 
 
 @contextmanager
-def snapshot_at(root: Path, cutoff: datetime) -> Iterator[Path]:
+def snapshot_tree(root: Path, revision: Optional[str]) -> Iterator[Path]:
     root = Path(root).resolve()
-    revision = snapshot_revision(root, cutoff)
     with tempfile.TemporaryDirectory(prefix="cs-study-snapshot-") as temporary:
         destination = Path(temporary)
         if revision is not None:
             _materialize(root, revision, destination)
         yield destination
+
+
+@contextmanager
+def snapshot_at(root: Path, cutoff: datetime) -> Iterator[Path]:
+    with snapshot_tree(root, snapshot_revision(root, cutoff)) as snapshot:
+        yield snapshot

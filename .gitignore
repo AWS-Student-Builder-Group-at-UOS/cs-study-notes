@@ -9,4 +9,6 @@ __pycache__/
 .study/runtime.json
 .study/runtime.json.tmp
 .study/state.json.tmp
+.study/secrets.json
+.study/secrets.json.tmp
 *.log
