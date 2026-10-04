@@ -112,13 +112,18 @@ def send_message(webhook_url: str, content: str, *, username: str) -> str:
                 delivery_uncertain=True,
             )
 
-        if status == 429 or 500 <= status <= 599:
+        if 500 <= status <= 599:
+            raise WebhookError(
+                "Discord server error (HTTP %d); delivery is unknown. Check the channel before replaying." % status,
+                delivery_uncertain=True,
+            )
+
+        if status == 429:
             if attempt == MAX_ATTEMPTS - 1:
                 raise WebhookError(
                     "Discord rejected delivery after the automatic retry limit (HTTP %d)." % status,
-                    delivery_uncertain=status >= 500,
                 )
-            delay = _retry_delay(response_body, headers) if status == 429 else 2 ** attempt
+            delay = _retry_delay(response_body, headers)
             time.sleep(delay)
             continue
 

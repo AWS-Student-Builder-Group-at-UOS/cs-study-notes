@@ -6,4 +6,7 @@ __pycache__/
 !.env.example
 .venv/
 .study/run.lock
+.study/runtime.json
+.study/runtime.json.tmp
+.study/state.json.tmp
 *.log

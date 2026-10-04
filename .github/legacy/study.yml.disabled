@@ -1,3 +1,6 @@
+# LEGACY: GitHub 예약 실행의 장시간 지연·누락 때문에 비활성화했습니다.
+# .github/workflows 밖의 .disabled 파일이므로 GitHub Actions가 읽지 않습니다.
+# 이전 운영 방식의 보관본입니다. 현재 실행 명령은 루트 AUTOMATION.md를 참고하세요.
 name: Study automation
 
 on:
@@ -17,7 +20,6 @@ on:
       - study_config.py
       - requirements.txt
       - scripts/**
-      - tests/**
       - .github/workflows/study.yml
   workflow_dispatch:
     inputs:
@@ -51,8 +53,6 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python3 -m pip install -r requirements.txt
-      - name: Test study automation
-        run: python3 -m unittest discover -s tests
       - name: Configure automation author
         run: |
           git config user.name 'github-actions[bot]'

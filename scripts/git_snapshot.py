@@ -119,7 +119,7 @@ def snapshot_revision(root: Path, cutoff: datetime) -> Optional[str]:
         purpose="Cannot determine whether Git history is complete. Fetch the full repository history.",
     ).stdout.strip()
     if shallow != b"false":
-        raise SnapshotError("A full Git history is required. Set actions/checkout fetch-depth to 0.")
+        raise SnapshotError("전체 Git 이력이 필요합니다. git fetch --unshallow origin으로 이력을 가져오세요.")
 
     repository = github_repository(root)
     if repository:

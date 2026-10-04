@@ -18,13 +18,15 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import study_config as config
-from scripts.discord_webhook import WebhookError, send_message
+from scripts import study_config as config
+from scripts.discord_webhook import send_message
+from scripts.delivery import (DeliveryError, DeliveryStore, atomic_json, event_key,
+                              runtime_directory)
 from scripts.git_snapshot import SnapshotError, snapshot_at
 from scripts.submission import has_content
 
 KST = ZoneInfo(config.TIMEZONE)
-RESERVED = {"scripts", "docs", "study_config.py", "README.md"}
+RESERVED = {"scripts", "README.md", "AUTOMATION.md"}
 
 
 class StudyError(RuntimeError):
@@ -101,25 +103,10 @@ def at(value):
     return result.astimezone(KST)
 
 
-def due_events(now, events=None):
+def due_events(now, events=None, *, kind=None):
     return [event for event in (events if events is not None else calendar_events())
-            if at(event["scheduled_at"]) <= now
-            and at(event["scheduled_at"]).date() == now.astimezone(KST).date()]
-
-
-def atomic_json(path, data):
-    if path.is_symlink():
-        raise StudyError("상태 파일은 심볼릭 링크일 수 없습니다.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    if temporary.exists() or temporary.is_symlink():
-        temporary.unlink()
-    with temporary.open("x", encoding="utf-8") as stream:
-        json.dump(data, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+            if (kind is None or event["kind"] == kind)
+            and timedelta() <= now - at(event["scheduled_at"]) < timedelta(minutes=10)]
 
 
 def validate_state(state):
@@ -167,12 +154,6 @@ def load_state(root):
         raise StudyError(".study/state.json이 손상되었습니다. 이전 기록을 복구해 주세요.") from None
     validate_state(state)
     return state
-
-
-def ensure_dir(path):
-    if path.is_symlink() or (path.exists() and not path.is_dir()):
-        raise StudyError(f"폴더 경로를 확인해 주세요: {path.name}")
-    path.mkdir(exist_ok=True)
 
 
 def sync_folders(root, state, now):
@@ -332,7 +313,10 @@ def close_rounds(root, state, now):
         cutoff = datetime.combine(due + timedelta(days=1), time(), KST)
         with snapshot_at(root, cutoff) as snapshot:
             try:
-                tree = ast.parse((snapshot / "study_config.py").read_text(encoding="utf-8"))
+                config_path = snapshot / "scripts/study_config.py"
+                if not config_path.exists():
+                    config_path = snapshot / "study_config.py"
+                tree = ast.parse(config_path.read_text(encoding="utf-8"))
                 members = next(ast.literal_eval(node.value) for node in tree.body
                                if isinstance(node, ast.Assign)
                                and any(isinstance(target, ast.Name) and target.id == "MEMBERS"
@@ -465,34 +449,63 @@ def render_status(root, now, state):
 
 
 def git(root, *args):
-    result = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise StudyError("Git 작업이 시간 내에 끝나지 않았습니다. 네트워크·원격 상태를 확인하세요.") from None
     if result.returncode:
         raise StudyError("Git 작업이 실패했습니다. 원격 권한·브랜치·충돌 상태를 확인해 주세요.")
     return result.stdout.strip()
 
 
-def persist(root, label):
-    git(root, "add", "--all")
-    if git(root, "diff", "--cached", "--name-only"):
-        git(root, "commit", "-m", f"chore(study): {label}")
-    git(root, "push", "origin", "HEAD")
-
-
 def check_checkout(root):
-    if git(root, "status", "--porcelain"):
-        raise StudyError("자동 커밋은 변경 사항이 없는 전용 체크아웃에서 실행해 주세요.")
     if git(root, "branch", "--show-current") != "main":
-        raise StudyError("자동 커밋은 main 브랜치에서만 실행합니다.")
-    git(root, "fetch", "origin", "main")
-    if git(root, "rev-parse", "HEAD") != git(root, "rev-parse", "FETCH_HEAD"):
-        raise StudyError("원격 main이 변경되었습니다. 최신 코드로 갱신한 뒤 다시 실행하세요.")
+        raise StudyError("자동 게시에는 main 전용 체크아웃이 필요합니다.")
+    changed = set()
+    for args in (("diff", "--name-only", "-z"),
+                 ("diff", "--cached", "--name-only", "-z"),
+                 ("ls-files", "--others", "--exclude-standard", "-z")):
+        changed.update(filter(None, git(root, *args).split("\0")))
+    for name in changed:
+        if name == ".study/state.json":
+            continue
+        path = root / name
+        if (path.name == ".gitkeep" and len(path.relative_to(root).parts) == 3
+                and path.relative_to(root).parts[0] in config.MEMBERS
+                and path.is_file() and not path.is_symlink() and path.stat().st_size == 0):
+            continue
+        raise StudyError("미커밋 변경이 있어 자동 게시를 중단했습니다. 전용 체크아웃을 확인하세요.")
+
+
+def persist(root, folders):
+    paths = [".study/state.json"] + sorted(set(folders))
+    # 생성·이동한 참여자 경로와 운영 기록만 커밋한다.
+    paths = [path for path in paths if (root / path).exists()
+             or git(root, "ls-files", "--", path)]
+    git(root, "add", "--all", "--", *paths)
+    if git(root, "diff", "--cached", "--name-only"):
+        git(root, "commit", "-m", "chore(study): sync study records")
+    try:
+        git(root, "push", "origin", "HEAD:main")
+    except StudyError:
+        git(root, "fetch", "origin", "main")
+        subjects = git(root, "log", "origin/main..HEAD", "--format=%s").splitlines()
+        if not subjects or any(not subject.startswith("chore(study): ") for subject in subjects):
+            raise StudyError("Git 게시가 실패했습니다. 로컬 기록을 보존한 채 원격 상태를 확인하세요.") from None
+        try:
+            git(root, "rebase", "origin/main")
+        except StudyError:
+            git(root, "rebase", "--abort")
+            raise StudyError("자동 게시 충돌: 기존 기록을 보존했습니다. 알림을 재전송하지 말고 Git 충돌만 해결하세요.") from None
+        git(root, "push", "origin", "HEAD:main")
 
 
 @contextmanager
 def exclusive_lock(root):
-    ensure_dir(root / ".study")
-    lock_path = root / ".study/run.lock"
+    directory = runtime_directory(root)
+    directory.mkdir(parents=True, exist_ok=True)
+    lock_path = directory / "run.lock"
     if lock_path.is_symlink():
         raise StudyError("실행 잠금 파일이 올바르지 않습니다.")
     with lock_path.open("a") as stream:
@@ -507,108 +520,165 @@ def exclusive_lock(root):
 
 
 def deliver(content):
-    if not content.strip() or len(content) > 2000:
-        raise StudyError("Discord 메시지는 1~2000자여야 합니다.")
-    try:
-        send_message(os.environ["DISCORD_WEBHOOK_URL"], content, username=config.BOT_NAME)
-    except WebhookError as error:
-        raise StudyError(f"알림 전송을 확인해 주세요. {error}") from None
+    return send_message(os.environ["DISCORD_WEBHOOK_URL"], content, username=config.BOT_NAME)
 
 
-def status(root, now, *, send=False, persist_changes=False):
-    if persist_changes and not send:
-        raise StudyError("--persist는 --send와 함께 사용하세요.")
-    if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
-        raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
-    if persist_changes:
-        check_checkout(root)
+def status(root, now):
     state = load_state(root)
-    changes = close_rounds(root, state, now)
-    if send:
-        changes += sync_folders(root, state, now)
-        for change in changes:
-            print(change)
-        atomic_json(root / ".study/state.json", state)
-        if persist_changes:
-            persist(root, "sync study records")
-    content = render_status(root, now, state)
-    print(content)
-    if send:
-        deliver(content)
+    close_rounds(root, state, now)
+    print(render_status(root, now, state))
 
 
-def run(root, now, *, send=False, persist_changes=False):
-    if persist_changes and not send:
-        raise StudyError("--persist는 --send와 함께 사용하세요.")
-    if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
-        raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
-    if persist_changes:
-        check_checkout(root)
-    state = load_state(root)
-    members, _ = validate_config()
-    selected = due_events(now)
+def synchronize(root, state, now):
     changes = close_rounds(root, state, now) + sync_folders(root, state, now)
-    state_path = root / ".study/state.json"
-    atomic_json(state_path, state)
-    if persist_changes:
-        persist(root, "sync participant folders")
+    atomic_json(root / ".study/state.json", state)
     for change in changes:
         print(change)
-    for event in selected:
-        result = event_result(root, event, members, state)
-        content = render_message(event, result, now, state)
-        print(content)
-        if not send:
-            continue
-        deliver(content)
+
+
+def run(root, now, *, kind, send=False, persist_changes=False):
+    if persist_changes and (not send or kind != "final"):
+        raise StudyError("--persist는 run --kind final --send에서만 사용하세요.")
+    store = DeliveryStore(root)
+    data = store.load() if send else None
+    selected = [event for event in due_events(now, kind=kind)
+                if data is None or store.active(event, data)]
     if not selected:
-        print("오늘 예약된 알림이 없습니다. 폴더 동기화를 완료했습니다.")
+        if data is not None:
+            today = [event for event in calendar_events() if event["kind"] == kind
+                     and at(event["scheduled_at"]).date() == now.astimezone(KST).date()]
+            issues = store.problems(data, today, now)
+            if issues:
+                raise DeliveryError("; ".join(issues))
+        print("현재 발송할 예약이 없습니다.")
+        return
+    if send and not os.environ.get("DISCORD_WEBHOOK_URL"):
+        raise StudyError("DISCORD_WEBHOOK_URL 환경 변수가 필요합니다.")
+    state = load_state(root)
+    folders = set(state["members"].values()) | set(config.MEMBERS)
+    publication_error = None
+    if send and kind == "final":
+        # Git 사전 점검이 실패해도 확정 결과와 Discord 발송은 별도로 처리한다.
+        if persist_changes:
+            try:
+                check_checkout(root)
+            except StudyError as error:
+                publication_error = error
+        store.publication(data, True)
+        synchronize(root, state, now)
+        folders.update(state["members"].values())
+    else:
+        # 오전 현황에서는 폴더·Git·확정 기록을 변경하지 않는다.
+        close_rounds(root, state, now)
+    delivery_error = None
+    try:
+        for event in selected:
+            result = event_result(root, event, list(config.MEMBERS), state)
+            content = render_message(event, result, now, state)
+            if send:
+                store.send(data, event, now, lambda: deliver(content))
+            else:
+                print(content)
+    except DeliveryError as error:
+        delivery_error = error
+    # Discord 확인을 기록한 뒤 게시한다. 실패해도 다음 실행은 발송 기록을 먼저 본다.
+    if send and kind == "final" and persist_changes:
+        try:
+            if publication_error:
+                raise publication_error
+            persist(root, folders)
+            store.publication(data, False)
+        except StudyError as error:
+            publication_error = error
+    if delivery_error or publication_error:
+        raise StudyError("; ".join(str(error) for error in (delivery_error, publication_error) if error))
+
+
+def sync(root, now, persist_changes):
+    if persist_changes:
+        check_checkout(root)
+    store = DeliveryStore(root)
+    data = store.load()
+    state = load_state(root)
+    folders = set(state["members"].values()) | set(config.MEMBERS)
+    store.publication(data, True)
+    synchronize(root, state, now)
+    folders.update(state["members"].values())
+    if persist_changes:
+        persist(root, folders)
+        store.publication(data, False)
+
+
+def resolve(root, now, args):
+    store = DeliveryStore(root)
+    data = store.load()
+    event = next((event for event in calendar_events() if event_key(event) == args.event), None)
+    if event is None or not store.active(event, data) or at(event["scheduled_at"]) > now:
+        raise StudyError("운영 시작 이후의 지난 알림만 확인 처리할 수 있습니다.")
+    previous = data["events"].get(args.event, {}).get("status")
+    if previous == "sent":
+        raise StudyError("이미 도착이 확인된 알림입니다. 발송 기록을 변경하지 않습니다.")
+    if args.message_id:
+        if not re.fullmatch(r"[0-9]{1,20}", args.message_id):
+            raise StudyError("Discord 메시지 ID를 숫자로 지정하세요.")
+        store.record(data, event, "sent", now, args.message_id)
+    elif args.retry:
+        if previous not in ("sending", "unknown", "failed") or event not in due_events(now):
+            raise StudyError("재시도 허용은 실패·불확실한 알림의 예정 시각 이후 10분 이내에만 가능합니다.")
+        store.record(data, event, "failed", now)
+    else:
+        store.record(data, event, "skipped", now)
+    print("발송 기록을 확인 처리했습니다. 메시지는 보내지 않았습니다.")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="CS 회고 스터디 자동화 (기본: 전송하지 않음)")
+    parser = argparse.ArgumentParser(description="CS 회고 스터디 직접 실행")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("schedule", help="한국 시간 기준 전체 알림 일정 JSON 출력")
-    for name in ("sync", "preview", "run", "status"):
-        command = sub.add_parser(name)
-        if name == "sync":
-            command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
-        if name in ("run", "status"):
-            command.add_argument("--send", action="store_true")
-            command.add_argument("--persist", action="store_true", help="자동화용 Git 커밋/푸시")
+    sub.add_parser("schedule", help="한국 시간 기준 전체 일정과 알림 ID")
+    sub.add_parser("status", help="현재 제출 현황 조회 (저장·전송 없음)")
+    sub.add_parser("init", help="최초 한 번만 발송 기록 생성; 이후 예약부터 관리")
+    sub.add_parser("check", help="5분 이상 지난 알림의 도착 확인 및 게시 누락 검사")
+    sync_parser = sub.add_parser("sync", help="마감 확정·폴더 동기화 및 게시 재시도")
+    sync_parser.add_argument("--persist", action="store_true")
+    runner = sub.add_parser("run", help="현재 10분 이내의 예약만 처리")
+    runner.add_argument("--kind", choices=("reminder", "final"), required=True)
+    runner.add_argument("--send", action="store_true")
+    runner.add_argument("--persist", action="store_true")
+    resolver = sub.add_parser("resolve", help="Discord 채널을 직접 확인한 뒤 기록 정정")
+    resolver.add_argument("--event", required=True)
+    outcome = resolver.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--message-id")
+    outcome.add_argument("--retry", action="store_true", help="미도착을 확인한 불확실한 발송의 재시도 허용")
+    outcome.add_argument("--skip", action="store_true", help="이 알림을 보내지 않기로 확정")
     args = parser.parse_args(argv)
     try:
         validate_config()
         if args.command == "schedule":
-            print(json.dumps(calendar_events(), ensure_ascii=False, indent=2))
+            print(json.dumps([dict(event, id=event_key(event)) for event in calendar_events()],
+                             ensure_ascii=False, indent=2))
             return 0
         now = datetime.now(KST)
-        if args.command == "status" and not args.send:
-            status(ROOT, now, persist_changes=args.persist)
-            return 0
-        if args.command == "preview":
-            state = load_state(ROOT)
-            close_rounds(ROOT, state, now)
-            for event in due_events(now):
-                result = event_result(ROOT, event, list(config.MEMBERS), state)
-                print(render_message(event, result, now, state))
+        if args.command == "status":
+            status(ROOT, now)
             return 0
         with exclusive_lock(ROOT):
-            if args.command == "sync":
-                state = load_state(ROOT)
-                if args.persist:
-                    check_checkout(ROOT)
-                for change in close_rounds(ROOT, state, now) + sync_folders(ROOT, state, now):
-                    print(change)
-                atomic_json(ROOT / ".study/state.json", state)
-                if args.persist:
-                    persist(ROOT, "sync participant folders")
+            if args.command == "init":
+                DeliveryStore(ROOT).initialize(now)
+                print("발송 기록을 생성했습니다. 이 시각 이후 예약부터 관리합니다.")
+            elif args.command == "check":
+                store = DeliveryStore(ROOT)
+                issues = store.problems(store.load(), calendar_events(), now)
+                if issues:
+                    raise DeliveryError("; ".join(issues))
+                print("누락·불확실한 발송·미게시 기록이 없습니다.")
+            elif args.command == "sync":
+                sync(ROOT, now, args.persist)
+            elif args.command == "resolve":
+                resolve(ROOT, now, args)
             elif args.command == "run":
-                run(ROOT, now, send=args.send, persist_changes=args.persist)
-            elif args.command == "status":
-                status(ROOT, now, send=args.send, persist_changes=args.persist)
+                run(ROOT, now, kind=args.kind, send=args.send, persist_changes=args.persist)
         return 0
-    except (StudyError, SnapshotError, ValueError, OSError) as error:
+    except (StudyError, DeliveryError, SnapshotError, ValueError, OSError) as error:
         print(f"오류: {error}", file=sys.stderr)
         return 1
 
