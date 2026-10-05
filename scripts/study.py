@@ -70,6 +70,18 @@ def validate_config():
         raise StudyError("모든 마감일은 일요일이어야 합니다.")
     if any((b - a).days != 14 for a, b in zip(deadlines, deadlines[1:])):
         raise StudyError("마감일은 2주 간격이어야 합니다.")
+    extensions = config.DEADLINE_EXTENSIONS
+    if not isinstance(extensions, dict) or set(extensions) - set(config.DEADLINES):
+        raise StudyError("DEADLINE_EXTENSIONS에는 기존 회차의 마감일을 키로 지정하세요.")
+    for original, extended in extensions.items():
+        try:
+            revised = date.fromisoformat(extended)
+        except (TypeError, ValueError):
+            raise StudyError("연장 마감일은 YYYY-MM-DD 날짜여야 합니다.") from None
+        index = list(config.DEADLINES).index(original)
+        if (revised.isoformat() != extended or revised <= deadlines[index]
+                or (index + 1 < len(deadlines) and revised >= deadlines[index + 1])):
+            raise StudyError("연장 마감일은 원래 마감 이후이며 다음 회차 전이어야 합니다.")
     if tuple(config.REMINDER_DAYS) != (7, 3, 1, 0):
         raise StudyError("REMINDER_DAYS는 (7, 3, 1, 0)이어야 합니다.")
     if type(config.REMINDER_HOUR) is not int or not 0 <= config.REMINDER_HOUR <= 23:
@@ -77,6 +89,10 @@ def validate_config():
     if len(members) > 30:
         raise StudyError("Discord 체크리스트는 최대 30명까지 지원합니다.")
     return members, deadlines
+
+
+def effective_deadline(due):
+    return date.fromisoformat(config.DEADLINE_EXTENSIONS.get(due.isoformat(), due.isoformat()))
 
 
 def calendar_events():
@@ -89,7 +105,7 @@ def calendar_events():
                            "deadline": due.isoformat(), "kind": "reminder",
                            "scheduled_at": scheduled.isoformat()})
         if config.SEND_FINAL_RESULTS:
-            scheduled = datetime.combine(due + timedelta(days=1), time(), KST)
+            scheduled = datetime.combine(effective_deadline(due) + timedelta(days=1), time(), KST)
             events.append({"round": index,
                            "deadline": due.isoformat(), "kind": "final",
                            "scheduled_at": scheduled.isoformat()})
@@ -216,7 +232,7 @@ def sync_folders(root, state, now):
             registry[name] = archived
     dates_to_create = []
     for due in deadlines:
-        if due >= today:
+        if effective_deadline(due) >= today:
             dates_to_create.append(due)
             break
     for member in members:
@@ -308,9 +324,10 @@ def close_rounds(root, state, now):
     _, deadlines = validate_config()
     closed = {}
     for due in deadlines:
-        if due >= now.astimezone(KST).date() or due.isoformat() in state["rounds"]:
+        actual_due = effective_deadline(due)
+        if actual_due >= now.astimezone(KST).date() or due.isoformat() in state["rounds"]:
             continue
-        cutoff = datetime.combine(due + timedelta(days=1), time(), KST)
+        cutoff = datetime.combine(actual_due + timedelta(days=1), time(), KST)
         with snapshot_at(root, cutoff) as snapshot:
             try:
                 config_path = snapshot / "scripts/study_config.py"
@@ -352,8 +369,10 @@ def event_result(root, event, members, state):
 
 
 def deadline_label(due, now):
+    due = effective_deadline(due)
     year = f"{due.year}년 " if due.year != now.astimezone(KST).year else ""
-    return f"{year}{due.month}월 {due.day}일(일) 밤 11시 59분"
+    weekday = "월화수목금토일"[due.weekday()]
+    return f"{year}{due.month}월 {due.day}일({weekday}) 밤 11시 59분"
 
 
 def status_lines(result, now, closed=False):
@@ -416,7 +435,7 @@ def render_message(event, result, now, state):
         lines += [f"**{event['round']}회차 회고가 마감됐어요!**",
                   f"{deadline}까지의 제출 결과를 정리했어요."]
     else:
-        remaining = (due - now.astimezone(KST).date()).days
+        remaining = (effective_deadline(due) - now.astimezone(KST).date()).days
         if remaining == 0:
             lines += [f"**오늘은 {event['round']}회차 회고 마감일이에요! ⏰**"]
         else:
@@ -429,12 +448,14 @@ def render_message(event, result, now, state):
 def render_status(root, now, state):
     members, deadlines = validate_config()
     today = now.astimezone(KST).date()
-    current = next((index for index, due in enumerate(deadlines) if due >= today), None)
+    current = next((index for index, due in enumerate(deadlines)
+                    if effective_deadline(due) >= today), None)
     ended = current is None
     index = len(deadlines) - 1 if ended else current
     due = deadlines[index]
+    actual_due = effective_deadline(due)
     event = {"deadline": due.isoformat(), "kind": "final" if ended else "reminder",
-             "scheduled_at": datetime.combine(due + timedelta(days=1), time(), KST).isoformat()}
+             "scheduled_at": datetime.combine(actual_due + timedelta(days=1), time(), KST).isoformat()}
     result = event_result(root, event, members, state)
     lines = [f"안녕하세요! 여러분의 회고를 챙기는 {config.BOT_NAME}이에요! 🐾", ""]
     deadline = deadline_label(due, now)
@@ -443,8 +464,8 @@ def render_status(root, now, state):
                   f"{deadline}까지의 제출 결과예요."]
     else:
         lines += [f"**{index + 1}회차 회고는 {deadline}까지예요.**"]
-        lines += ["오늘 마감이에요! 잊지 말고 회고를 올려 주세요. ⏰" if due == today
-                  else f"마감까지 {(due - today).days}일 남았어요. 이번에도 함께 기록해 봐요!"]
+        lines += ["오늘 마감이에요! 잊지 말고 회고를 올려 주세요. ⏰" if actual_due == today
+                  else f"마감까지 {(actual_due - today).days}일 남았어요. 이번에도 함께 기록해 봐요!"]
     return "\n".join(lines + [""] + message_tail(result, now, state, ended))
 
 

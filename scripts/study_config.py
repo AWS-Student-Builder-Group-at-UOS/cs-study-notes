@@ -22,6 +22,9 @@ DEADLINES = (
     "2026-12-27",
 )
 
+# 기존 회차·제출 폴더와 사전 알림은 유지하고, 실제 마감·최종 처리를 연장합니다.
+DEADLINE_EXTENSIONS = {"2026-10-04": "2026-10-05"}
+
 TIMEZONE = "Asia/Seoul"
 REMINDER_DAYS = (7, 3, 1, 0)
 REMINDER_HOUR = 9
