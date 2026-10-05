@@ -253,11 +253,12 @@ def sync_folders(root, state, now):
             directories.append(folder)
         registry[member] = member
         for due in dates_to_create:
-            target = folder / due.isoformat()
-            physical = source / due.isoformat()
+            round_folder = effective_deadline(due).isoformat()
+            target = folder / round_folder
+            physical = source / round_folder
             target_exists = inspect_directory(physical)
             if not target_exists:
-                changes.append(f"회차 생성: {member}/{due}")
+                changes.append(f"회차 생성: {member}/{round_folder}")
                 directories.append(target)
             if not target_exists or not any(physical.iterdir()):
                 placeholders.append(target / ".gitkeep")
@@ -308,7 +309,8 @@ def sync_folders(root, state, now):
 
 
 def submission_status(root, member, deadline, folder=None):
-    target = root / (folder or member) / deadline
+    round_folder = effective_deadline(date.fromisoformat(deadline)).isoformat()
+    target = root / (folder or member) / round_folder
     if target.parent.is_symlink() or target.is_symlink() or not target.is_dir():
         return False
     for base, dirs, files in os.walk(target, followlinks=False):
